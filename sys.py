@@ -1,0 +1,489 @@
+﻿# -*- coding: utf-8 -*-
+import os
+import re
+import json
+import time
+import ssl
+import httpx
+import warnings
+import vlc
+import asyncio
+import random
+from datetime import datetime, timedelta
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram.request import HTTPXRequest
+import yt_dlp
+
+# --- 0. AYARLAR ---
+warnings.filterwarnings("ignore")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PLAYLIST_DIR = os.path.join(BASE_DIR, "playlist")
+os.makedirs(PLAYLIST_DIR, exist_ok=True)
+
+# Teneffüs Programı — kaynak: Farabi sunucusundaki resmi e-Okul çizelgesi
+# (/home/ata/farabi/tahtayoklama/dashboard/data/zil.json). Okul zili değişirse
+# oradaki dosya da güncellenip buraya elle yansıtılmalı (iki sunucu arasında
+# otomatik senkron yok). Her tuple (ders çıkışı, sonraki ders girişi).
+TENEFUS_PROGRAMI = [
+    ("08:50", "09:00"),
+    ("09:40", "09:50"),
+    ("10:30", "10:40"),
+    ("11:20", "11:30"),
+    ("12:10", "13:30"),   # öğle arası
+    ("14:10", "14:20"),
+    ("15:00", "15:10"),
+]
+
+def saat_ekle(saat_str, dakika):
+    t = datetime.strptime(saat_str, "%H:%M") + timedelta(minutes=dakika)
+    return t.strftime("%H:%M")
+
+# Her teneffüs için: müzik ders çıkışından 3 dk sonra başlar (kendi süresiyle biter,
+# playlist parçaları zaten ~2 dk), ders girişine 2 dk kala hâlâ çalıyorsa (ve otomatik
+# başlatıldıysa) güvenlik amaçlı durdurulur. Manuel başlatılan müzikler (etkinlik) bu
+# zorla-durdurmadan muaf tutulur (bkz. otomatik_calan bayrağı).
+TENEFUS_OLAYLARI = [
+    {"baslama": saat_ekle(cikis, 3), "durdurma": saat_ekle(giris, -2)}
+    for cikis, giris in TENEFUS_PROGRAMI
+]
+
+# Okul girişi karşılama müziği: ilk ders 08:10'da başlıyor, 07:50-07:55 arası
+# rastgele bir playlist parçası çalınsın (2026-09-16, kullanıcı isteği).
+TENEFUS_OLAYLARI.append({"baslama": "07:50", "durdurma": "07:55"})
+
+otomatik_calan = False
+
+def ayarlari_yukle():
+    ayarlar = {}
+    try:
+        # UTF-8-SIG kullanarak BOM karakteri sorununu önlüyoruz
+        with open(os.path.join(BASE_DIR, "env.txt"), "r", encoding="utf-8-sig") as f:
+            for satir in f:
+                satir = satir.strip()
+                if satir and "=" in satir:
+                    k, v = satir.split("=", 1)
+                    ayarlar[k.strip()] = v.strip()
+        return ayarlar
+    except Exception as e:
+        print(f"Ayar dosyası okuma hatası: {e}")
+        return None
+
+config = ayarlari_yukle()
+if not config:
+    print("HATA: env.txt dosyası bulunamadı veya okunamadı!")
+    exit()
+
+TOKEN = config.get("TELEGRAM_TOKEN")
+# CHAT_ID listesini integer listesine çeviriyoruz (Daha güvenli kontrol için)
+AUTHORIZED_IDS = [int(id.strip()) for id in config.get("CHAT_ID", "").split(",") if id.strip()]
+
+# Zamanlanmış tek seferlik duyurular — kalıcı JSON, servis restart/reboot sonrası korunur.
+DUYURU_DOSYASI = os.path.join(BASE_DIR, "duyurular.json")
+
+def duyurulari_yukle():
+    try:
+        with open(DUYURU_DOSYASI, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+def duyurulari_kaydet(duyurular):
+    with open(DUYURU_DOSYASI, "w", encoding="utf-8") as f:
+        json.dump(duyurular, f, ensure_ascii=False, indent=2)
+
+# VLC Ayarları
+instance = vlc.Instance('--no-video --quiet')
+player = instance.media_player_new()
+current_volume = 70
+OTOMATIK_SES_SEVIYESI = 50  # teneffüs/giriş otomasyonu her zaman bu seviyede çalar, current_volume'dan bağımsız
+player.audio_set_volume(current_volume)
+
+# --- 1. YARDIMCI FONKSİYONLAR ---
+async def yetki_kontrol(update: Update):
+    chat_id = update.effective_chat.id
+    return chat_id in AUTHORIZED_IDS
+
+def dosya_listele():
+    uzantilar = ('.mp3', '.wav', '.ogg', '.opus', '.m4a')
+    # Sadece playlist/ alt klasöründeki dosyaları getir (istiklal/siren ayrı komut/buton)
+    return [f for f in os.listdir(PLAYLIST_DIR) if f.lower().endswith(uzantilar)]
+
+def rastgele_playlist_dosyasi():
+    dosyalar = dosya_listele()
+    return random.choice(dosyalar) if dosyalar else None
+
+def playlist_sayfa_metni(sayfa=1, sayfa_boyutu=40):
+    dosyalar = sorted(dosya_listele())
+    toplam = len(dosyalar)
+    if toplam == 0:
+        return "Playlist'te dosya yok."
+    toplam_sayfa = (toplam + sayfa_boyutu - 1) // sayfa_boyutu
+    sayfa = max(1, min(sayfa, toplam_sayfa))
+    baslangic = (sayfa - 1) * sayfa_boyutu
+    parca = dosyalar[baslangic: baslangic + sayfa_boyutu]
+    satirlar = "\n".join(parca)
+    return (
+        f"📁 Playlist ({toplam} dosya) — sayfa {sayfa}/{toplam_sayfa}:\n{satirlar}\n\n"
+        f"Silmek için: /sil <dosya_adi>\nDiğer sayfa: /sil sayfa <n>"
+    )
+
+async def tenefus_otomasyonu():
+    global otomatik_calan
+    while True:
+        simdi_dt = datetime.now()
+        # Farabi'nin ders_gunleri'yle aynı: sadece Pazartesi(1)-Cuma(5)
+        if simdi_dt.isoweekday() in (1, 2, 3, 4, 5):
+            simdi = simdi_dt.strftime("%H:%M")
+            for olay in TENEFUS_OLAYLARI:
+                if simdi == olay["baslama"] and not player.is_playing():
+                    dosya = rastgele_playlist_dosyasi()
+                    if dosya:
+                        yol = os.path.join(PLAYLIST_DIR, dosya)
+                        player.set_media(instance.media_new(yol))
+                        player.play()
+                        player.audio_set_volume(OTOMATIK_SES_SEVIYESI)
+                        otomatik_calan = True
+                        print(f"🔔 Otomatik teneffüs müziği başladı: {dosya} (%{OTOMATIK_SES_SEVIYESI})")
+                if simdi == olay["durdurma"] and player.is_playing() and otomatik_calan:
+                    player.stop()
+                    print("🔕 Ders girişine 2 dk kala otomatik müzik durduruldu.")
+        await asyncio.sleep(30)
+
+# --- 2. KOMUTLAR ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await yetki_kontrol(update): return
+    kb = [
+        ['/istiklal', '/siren'], ['/list', '/durdur'],
+        ['/ses_artir', '/ses_azalt'], ['/sil', '/duyuru_liste'], ['/reboot'],
+    ]
+    await update.message.reply_text(
+        "🏫 Okul Zil Sistemi Aktif.\n"
+        "YouTube: bir YouTube linki yapıştırmanız yeterli, otomatik çalar.\n"
+        "Dosya silme: /sil (liste) veya /sil <dosya_adi>\n"
+        "Zamanlanmış duyuru: /duyuru_ekle YYYY-AA-GG SS:DD <dosya_veya_link>, /duyuru_liste, /duyuru_sil <id>",
+        reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True)
+    )
+
+async def istiklal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await yetki_kontrol(update): return
+    global otomatik_calan
+    yol = os.path.join(BASE_DIR, "istiklal.mp3")
+    if os.path.exists(yol):
+        player.set_media(instance.media_new(yol))
+        player.play()
+        player.audio_set_volume(current_volume)
+        otomatik_calan = False
+        await update.message.reply_text("🇹🇷 İstiklal Marşı çalınıyor...")
+    else:
+        await update.message.reply_text("❌ istiklal.mp3 bulunamadı!")
+
+async def siren(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await yetki_kontrol(update): return
+    global otomatik_calan
+    yol = os.path.join(BASE_DIR, "siren.mp3")
+    if os.path.exists(yol):
+        player.set_media(instance.media_new(yol))
+        player.play()
+        player.audio_set_volume(current_volume)
+        otomatik_calan = False
+        await update.message.reply_text("🚨 Siren çalınıyor!")
+    else:
+        await update.message.reply_text("❌ siren.mp3 bulunamadı!")
+
+async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await yetki_kontrol(update): return
+    dosyalar = dosya_listele()
+    if not dosyalar:
+        return await update.message.reply_text("Klasörde ses dosyası yok.")
+    
+    kb = []
+    for f in dosyalar:
+        # Telegram callback_data 64 byte sınırı vardır. Dosya adı çok uzunsa kırpıyoruz.
+        callback_data = f"play:{f}"
+        if len(callback_data.encode('utf-8')) > 64:
+            # Sınırı aşan dosyaları listede göster ama uyarı ver (veya güvenli bir ID ata)
+            kb.append([InlineKeyboardButton(f"⚠️ İsim Çok Uzun: {f[:20]}...", callback_data="error_long")])
+        else:
+            kb.append([InlineKeyboardButton(f"▶️ {f}", callback_data=callback_data)])
+            
+    await update.message.reply_text("Mevcut Sesler:", reply_markup=InlineKeyboardMarkup(kb))
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not await yetki_kontrol(update): return
+    global otomatik_calan
+
+    await query.answer()
+    if query.data == "error_long":
+        await query.message.reply_text("❌ Bu dosyanın adı çok uzun olduğu için Telegram üzerinden başlatılamıyor.")
+        return
+
+    if query.data.startswith("play:"):
+        dosya = query.data.split(":", 1)[1]
+        yol = os.path.join(PLAYLIST_DIR, dosya)
+        if os.path.exists(yol):
+            player.set_media(instance.media_new(yol))
+            player.play()
+            player.audio_set_volume(current_volume)
+            otomatik_calan = False
+            await query.edit_message_text(f"▶️ Şu an çalıyor: {dosya}")
+        else:
+            await query.edit_message_text(f"❌ Dosya bulunamadı: {dosya}")
+
+async def handle_audio_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await yetki_kontrol(update): return
+    try:
+        msg = update.message
+        audio_source = msg.audio or msg.voice
+        file = await audio_source.get_file()
+        
+        # Dosya adını belirleme
+        if msg.audio and msg.audio.file_name:
+            dosya_adi = msg.audio.file_name
+        else:
+            ext = ".ogg" if msg.voice else ".mp3"
+            dosya_adi = f"gelen_{int(time.time())}{ext}"
+            
+        save_path = os.path.join(PLAYLIST_DIR, dosya_adi)
+        await file.download_to_drive(save_path)
+        await update.message.reply_text(f"✅ Kaydedildi: {dosya_adi}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Kayıt hatası: {e}")
+
+async def control_volume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await yetki_kontrol(update): return
+    global current_volume
+    if "artir" in update.message.text:
+        current_volume = min(100, current_volume + 10)
+    else:
+        current_volume = max(0, current_volume - 10)
+        
+    player.audio_set_volume(current_volume)
+    await update.message.reply_text(f"🔊 Ses Seviyesi: %{current_volume}")
+
+YOUTUBE_LINK_RE = re.compile(r'(https?://)?(www\.|m\.|music\.)?(youtube\.com|youtu\.be)/\S+', re.IGNORECASE)
+
+def youtube_ses_url_al(url):
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'noplaylist': True,
+        'quiet': True,
+        'no_warnings': True,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        return info['url'], info.get('title', 'YouTube Video')
+
+async def youtube_link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Komut değil: mesaj metninde YouTube linki geçiyorsa direkt çalar (2026-09-16, kullanıcı isteği)
+    if not await yetki_kontrol(update): return
+    global otomatik_calan
+    eslesme = YOUTUBE_LINK_RE.search(update.message.text or "")
+    if not eslesme:
+        return
+    url = eslesme.group(0)
+
+    durum_mesaji = await update.message.reply_text("🌐 YouTube bağlantısı kuruluyor...")
+    try:
+        audio_url, baslik = youtube_ses_url_al(url)
+        player.set_media(instance.media_new(audio_url))
+        player.play()
+        player.audio_set_volume(OTOMATIK_SES_SEVIYESI)  # bu özellik için sabit %50 istendi
+        otomatik_calan = False
+        await durum_mesaji.edit_text(f"▶️ Oynatılıyor (%{OTOMATIK_SES_SEVIYESI} ses): {baslik}")
+    except Exception as e:
+        await durum_mesaji.edit_text(f"❌ YouTube Hatası: {str(e)[:100]}")
+
+def duyuru_hedefi_gecerli_mi(hedef):
+    if YOUTUBE_LINK_RE.search(hedef):
+        return "youtube"
+    if hedef in ("istiklal.mp3", "siren.mp3"):
+        return "dosya"
+    if os.path.exists(os.path.join(PLAYLIST_DIR, os.path.basename(hedef))):
+        return "dosya"
+    return None
+
+async def reboot_pc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await yetki_kontrol(update): return
+    await update.message.reply_text("🔄 Sistem yeniden başlatılıyor (Sudo yetkisi gerektirir)...")
+    os.system("sudo reboot")
+
+async def durdur(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await yetki_kontrol(update): return
+    player.stop()
+    await update.message.reply_text("🛑 Ses durduruldu.")
+
+async def sil(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # playlist/ içindeki dosyaları Telegram üzerinden silmek için (2026-09-16).
+    # 286 dosya var, bu yüzden /list gibi buton değil düz metin+sayfalama kullanılıyor.
+    if not await yetki_kontrol(update): return
+    if not context.args:
+        return await update.message.reply_text(playlist_sayfa_metni(1))
+    if context.args[0].lower() == "sayfa":
+        try:
+            sayfa_no = int(context.args[1]) if len(context.args) > 1 else 1
+        except ValueError:
+            sayfa_no = 1
+        return await update.message.reply_text(playlist_sayfa_metni(sayfa_no))
+
+    # os.path.basename ile olası "../" gibi path traversal denemeleri etkisizleştirilir.
+    dosya_adi = os.path.basename(" ".join(context.args).strip())
+    if not dosya_adi or dosya_adi in ("istiklal.mp3", "siren.mp3"):
+        return await update.message.reply_text("❌ Bu dosya silinemez.")
+    yol = os.path.join(PLAYLIST_DIR, dosya_adi)
+    if os.path.exists(yol):
+        os.remove(yol)
+        await update.message.reply_text(f"✅ Silindi: {dosya_adi}")
+    else:
+        await update.message.reply_text(f"❌ Dosya bulunamadı: {dosya_adi}")
+
+async def duyuru_ekle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Belirli bir tarih/saatte tek seferlik otomatik anons (2026-09-16).
+    if not await yetki_kontrol(update): return
+    if len(context.args) < 3:
+        return await update.message.reply_text(
+            "Kullanım: /duyuru_ekle YYYY-AA-GG SS:DD <dosya_adi_veya_youtube_linki>"
+        )
+    tarih, saat = context.args[0], context.args[1]
+    hedef = " ".join(context.args[2:]).strip()
+
+    try:
+        zaman = datetime.strptime(f"{tarih} {saat}", "%Y-%m-%d %H:%M")
+    except ValueError:
+        return await update.message.reply_text("❌ Tarih/saat formatı hatalı. Örnek: 2026-09-20 10:00")
+    if zaman <= datetime.now():
+        return await update.message.reply_text("❌ Belirtilen an geçmişte kalıyor.")
+
+    tur = duyuru_hedefi_gecerli_mi(hedef)
+    if not tur:
+        return await update.message.reply_text(f"❌ Hedef bulunamadı/tanınmadı: {hedef}")
+
+    duyurular = duyurulari_yukle()
+    yeni_id = max((d["id"] for d in duyurular), default=0) + 1
+    duyurular.append({
+        "id": yeni_id, "tarih": tarih, "saat": saat,
+        "tur": tur, "hedef": hedef, "olusturan": update.effective_chat.id,
+    })
+    duyurulari_kaydet(duyurular)
+    await update.message.reply_text(f"✅ Duyuru eklendi (#{yeni_id}): {tarih} {saat} → {hedef}")
+
+async def duyuru_liste(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await yetki_kontrol(update): return
+    duyurular = duyurulari_yukle()
+    if not duyurular:
+        return await update.message.reply_text("Bekleyen duyuru yok.")
+    satirlar = [
+        f"#{d['id']} — {d['tarih']} {d['saat']} → {d['hedef']}"
+        for d in sorted(duyurular, key=lambda d: (d["tarih"], d["saat"]))
+    ]
+    await update.message.reply_text("📋 Bekleyen duyurular:\n" + "\n".join(satirlar))
+
+async def duyuru_sil(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await yetki_kontrol(update): return
+    if not context.args:
+        return await update.message.reply_text("Kullanım: /duyuru_sil <id>")
+    try:
+        hedef_id = int(context.args[0])
+    except ValueError:
+        return await update.message.reply_text("❌ Geçersiz id.")
+    duyurular = duyurulari_yukle()
+    kalanlar = [d for d in duyurular if d["id"] != hedef_id]
+    if len(kalanlar) == len(duyurular):
+        return await update.message.reply_text(f"❌ #{hedef_id} bulunamadı.")
+    duyurulari_kaydet(kalanlar)
+    await update.message.reply_text(f"🗑️ Duyuru silindi: #{hedef_id}")
+
+async def duyuru_otomasyonu(bot):
+    # Hafta içi kısıtı yok: kullanıcı hangi günü seçtiyse o gün çalışır (tenefus_otomasyonu'ndan farklı).
+    global otomatik_calan
+    while True:
+        simdi = datetime.now()
+        duyurular = duyurulari_yukle()
+        if duyurular:
+            kalanlar = []
+            degisti = False
+            for d in duyurular:
+                try:
+                    zaman = datetime.strptime(f"{d['tarih']} {d['saat']}", "%Y-%m-%d %H:%M")
+                except (ValueError, KeyError):
+                    degisti = True  # bozuk kayıt, listeden düş
+                    continue
+
+                fark_dk = (simdi - zaman).total_seconds() / 60
+                if fark_dk < 0:
+                    kalanlar.append(d)  # zamanı henüz gelmedi
+                    continue
+
+                degisti = True
+                if fark_dk <= 2:
+                    try:
+                        if d["tur"] == "youtube":
+                            audio_url, baslik = youtube_ses_url_al(d["hedef"])
+                            player.set_media(instance.media_new(audio_url))
+                        else:
+                            kok = BASE_DIR if d["hedef"] in ("istiklal.mp3", "siren.mp3") else PLAYLIST_DIR
+                            baslik = d["hedef"]
+                            player.set_media(instance.media_new(os.path.join(kok, d["hedef"])))
+                        player.play()
+                        player.audio_set_volume(current_volume)
+                        otomatik_calan = False
+                        mesaj = f"📢 Duyuru çalınıyor (#{d['id']}): {baslik}"
+                    except Exception as e:
+                        mesaj = f"❌ Duyuru çalınamadı (#{d['id']}): {str(e)[:100]}"
+                else:
+                    # Servis o dakikayı kaçırmış (ör. uzun süre kapalıydı) — günler sonra
+                    # beklenmedik çalmasın diye artık çalınmaz, sadece bildirilir.
+                    mesaj = f"⚠️ Kaçırılan duyuru (#{d['id']}, {d['tarih']} {d['saat']}): {d['hedef']}"
+
+                for chat_id in AUTHORIZED_IDS:
+                    try:
+                        await bot.send_message(chat_id=chat_id, text=mesaj)
+                    except Exception as e:
+                        print(f"Duyuru bildirimi gönderilemedi ({chat_id}): {e}")
+
+            if degisti:
+                duyurulari_kaydet(kalanlar)
+        await asyncio.sleep(30)
+
+# --- 3. ANA ÇALIŞTIRICI ---
+async def main():
+    # SSL Sertifika hatalarını önlemek için httpx istemcisi
+    client = httpx.AsyncClient(verify=False)
+    app = ApplicationBuilder().token(TOKEN).request(HTTPXRequest()).build()
+    
+    # Komutları Tanımla
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("istiklal", istiklal))
+    app.add_handler(CommandHandler("siren", siren))
+    app.add_handler(CommandHandler("list", list_files))
+    app.add_handler(CommandHandler("reboot", reboot_pc))
+    app.add_handler(CommandHandler("durdur", durdur))
+    app.add_handler(CommandHandler(["ses_artir", "ses_azalt"], control_volume))
+    app.add_handler(CommandHandler("sil", sil))
+    app.add_handler(CommandHandler("duyuru_ekle", duyuru_ekle))
+    app.add_handler(CommandHandler("duyuru_liste", duyuru_liste))
+    app.add_handler(CommandHandler("duyuru_sil", duyuru_sil))
+    app.add_handler(MessageHandler(filters.AUDIO | filters.VOICE, handle_audio_upload))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(YOUTUBE_LINK_RE), youtube_link_handler))
+    app.add_handler(CallbackQueryHandler(button_handler))
+
+    # Teneffüs ve duyuru döngülerini arka planda başlat
+    asyncio.create_task(tenefus_otomasyonu())
+    asyncio.create_task(duyuru_otomasyonu(app.bot))
+
+    print("--- SİSTEM VE TENEFFÜS OTOMASYONU AKTİF ---")
+    
+    async with app:
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling()
+        # Uygulamanın kapanmaması için sonsuz döngü
+        while True: 
+            await asyncio.sleep(3600)
+
+if __name__ == '__main__':
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("Sistem kapatıldı.")

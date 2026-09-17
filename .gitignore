@@ -1,0 +1,24 @@
+# Sanal ortam ve Python derleme dosyaları
+venv/
+__pycache__/
+*.pyc
+
+# Windows çalıştırılabilir dosyaları
+*.exe
+*.bat
+
+# Hassas ve oturum dosyaları
+cookies.txt
+env.txt
+*.log
+
+# Sertifikalar
+*.cer
+*.crt
+
+# Medya dosyaları (Repository şişmesini önlemek için)
+*.mp3
+playlist/
+
+# Yedek klasörü
+yedek/
