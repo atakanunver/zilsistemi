@@ -39,23 +39,13 @@ Tek dosyalık bot: `sys.py` (aktif/production kod, `BASE_DIR` = proje kökü).
 
 `ayarlari_yukle()` proje kökündeki `env.txt`'yi (`utf-8-sig`, BOM'lu) `KEY=VALUE` formatında okuyor: `TELEGRAM_TOKEN` ve `CHAT_ID` (virgülle ayrılmış, yetkili Telegram chat id'leri). **Bu dosyayı asla artifact/web/dış servise göndermeyin veya içeriğini dışarı kopyalamayın** — canlı bot token'ı içeriyor.
 
-## Git (2026-09-17'de eklendi) — ⚠️ push etmeden önce temizlik gerekiyor
+## Git (2026-09-17'de eklendi)
 
-`/home/atakan/ses` bugün (2026-09-17 10:32-10:33) ilk kez git deposu haline getirildi: `origin` → `git@github.com:atakanunver/zilsistemi.git` (SSH). Aynı gün 10:36'da bir SSH anahtarı üretildi (`~/.ssh/id_ed25519`, public key yorumu `atakanunver1@gmail.com` — muhtemelen bu depoyu push etmek için GitHub'a eklenecek bir deploy/kişisel anahtar).
+`/home/atakan/ses` bugün (2026-09-17) git deposu haline getirildi: `origin` → `git@github.com:atakanunver/zilsistemi.git` (SSH). Push için bir SSH anahtarı da üretildi (`~/.ssh/id_ed25519`, public key yorumu `atakanunver1@gmail.com`).
 
-**Kritik sorun**: `.gitignore` ikinci commit'te eklendi ama git zaten ilk commit'te `git add` ile **tüm proje kökünü** (muhtemelen `.gitignore` yazılmadan önce `git add -A`/`git add .`) commit'lemişti. Git, sonradan eklenen `.gitignore` kurallarını halihazırda takip edilen (tracked) dosyalara **geriye dönük uygulamaz** — bu yüzden şu an `git ls-files` çalıştırıldığında `.gitignore`'da listelenen tüm kategoriler hâlâ commit geçmişinde görünüyor:
-- **`env.txt` — canlı `TELEGRAM_TOKEN` içeriyor** (en kritik)
-- `cookies.txt` (YouTube çerezleri, muhtemelen geçersiz ama yine de hassas)
-- Tüm `.mp3` dosyaları (286 parça + `istiklal.mp3` + `siren.mp3`, ~110MB toplam) ve `.cer`/`.crt` sertifikaları
-- `ffmpeg.exe`/`ffplay.exe`/`ffprobe.exe` (Windows kalıntıları, ~300MB)
-- `yedek/` klasöründeki eski kopyalar
+**Bir kez düzeltme yapıldı (2026-09-17)**: İlk kurulumda `.gitignore` yazılmadan önce `git add -A` ile proje kökü tamamen commit'lenmişti — `env.txt` (canlı `TELEGRAM_TOKEN`), `cookies.txt`, tüm `.mp3`/`.cer`/`.crt`/`.exe` dosyaları ve `yedek/` dahil. Bu **hiç push edilmeden** fark edildi (doğrulama: `refs/remotes/origin/*` yoktu, reflog'da push izi yoktu). Kullanıcı isteğiyle depo sıfırdan başlatıldı (`rm -rf .git && git init` — history rewrite'a gerek kalmadı, çünkü hiç paylaşılmamıştı) ve `.gitignore` zaten yerindeyken `git add .` yapıldı. Şu an takip edilen dosyalar sadece: `.gitignore`, `CLAUDE.md`, `sys.py` ve diğer tarihli/isimli Python kopyaları (`sertifikalısys.py`, `sys14052026.py`, `sys1628saat.py`, `youtube-sys.py`), `split_playlist.sh` — **env.txt, cookies.txt, mp3'ler, sertifikalar, exe'ler ve `yedek/` takipte değil** (`git ls-files` ile doğrulandı).
 
-**Şu ana kadar push edilmedi** (2026-09-17'de doğrulandı): `git for-each-ref` içinde `refs/remotes/origin/*` yok, `git reflog --all`'da push'a dair bir iz yok, ve bu makineden `git ls-remote origin` okul LAN'ının filtreli internet çıkışı yüzünden 15 saniyede timeout veriyor (GitHub'a SSH/443 ile ulaşamıyor olabilir — diğer sunuculardaki filtreli internet sorunuyla tutarlı, bkz. global `CLAUDE.md`). Yani token şu an sadece yerel git geçmişinde, henüz GitHub'a sızmadı — ama bu haliyle bir `git push` denenirse (öry. ağ erişimi WifiHttpProxy gibi bir yolla sağlanırsa) sızacak.
-
-**Push etmeden önce yapılması gerekenler** (henüz yapılmadı, kullanıcıya danışılmadan otomatik yapılmadı):
-1. `env.txt`, `cookies.txt` ve `.gitignore`'daki diğer kategorileri `git rm --cached` ile index'ten çıkar (dosyalar diskte kalır, sadece takip bırakılır).
-2. İki commit'lik geçmiş zaten küçük ve **hiç push edilmedi** — history rewrite yerine en basit yol muhtemelen depoyu sıfırdan (`rm -rf .git && git init`) yeniden başlatıp sadece istenen dosyaları commit'lemek (repo henüz paylaşılmadığı için force-push/BFG gibi araçlara gerek yok).
-3. `TELEGRAM_TOKEN`'ın rotate edilip edilmeyeceğine karar ver — push hiç olmadıysa muhtemelen gerekmez, ama şüpheye düşülürse BotFather üzerinden `/revoke` ile yenilenebilir.
+**Henüz push edilmedi** — `origin` remote eklendi ama `git push` hiç çalıştırılmadı. Push denenirse dikkat: okul LAN'ının filtreli internet çıkışı GitHub'a SSH (22) ile ulaşmayı engelliyor olabilir (`git ls-remote origin` daha önce 15sn'de timeout vermişti — bkz. global `CLAUDE.md`'deki diğer sunuculardaki filtreli internet notları); SSH port 22 engelliyse GitHub'ın `ssh.github.com:443` üzerinden HTTPS-tüneli SSH desteği bir çözüm olabilir.
 
 ## Bilinen Sorunlar / Dikkat Edilecekler
 
