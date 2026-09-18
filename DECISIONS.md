@@ -53,3 +53,12 @@
 - Bug fix (aynı özellik geliştirilirken bulundu): etkinlik_dinleyici() işlenen komut dosyasını silmiyordu - servis restart olunca (bellekteki _son_istek_id sıfırlanınca) eski komut yeni sanılıp TEKRAR çalınıyordu. Bu YAKALANDI: bir test isteği, sonraki bir deploy restart'ında kendiliğinden tekrar tetiklendi ve ders sırasında kısaca (~20-30sn) gerçekten çaldı, hemen fark edilip durduruldu. Düzeltme: istek işlenir işlenmez dosya siliniyor.
 - Ayrıca bulunan bug: tenefus_otomasyonu()'daki VLC ayarları bölümünde eski bir 'OTOMATIK_SES_SEVIYESI = 50' sabit ataması vardı, ders_programi.json'dan yüklenen değeri başlangıçta eziyordu - kaldırıldı.
 - dashboard.py /youtube-cal sayfasında durum polling'i Yükleniyor... takılı kalıyordu - fetch() varsayılan olarak Basic Auth kimlik bilgilerini otomatik göndermiyordu, credentials:'same-origin' eklenerek düzeltildi.
+
+## 2026-09-18 - Katmanli zil sistemi: ogrenci toplan / giris / cikis / ogrenci girisi / ogretmen girisi
+
+- Kullanici istegi: zil katmanli olsun - 5 tur: 1) ogrenci toplan (gun/ogle sonrasi baslangici, sabit saat), 2) giris (toplanma sonrasi ilk ders), 3) cikis (her ders sonu), 4) ogrenci girisi (kisa tenefusun ortasinda uyari), 5) ogretmen girisi (dersin resmi baslangici, ogrenciden SONRA).
+- Dogrulanan akis (kullanici onayladi): 08:00 ogrenci toplan -> 08:10 giris -> 08:50 cikis -> 08:55 ogrenci girisi -> 09:00 ogretmen girisi (=2. ders baslangici) -> ...
+- ONEMLI: gercek zil CALMA saatleri zaten bir onceki oturumda (ogrenci_zili_aktif/offset_dk/max_bosluk_dk + sabit_ziller) dogru hesaplaniyordu - bu degisiklik SADECE dashboard'daki ETIKETLEME/GORUNURLUK, sys.py'nin calma mantigi degismedi.
+- dashboard.py'ye _zil_programi_hesapla() eklendi: her zil saatini turune gore etiketliyor (Giris vs Ogretmen Girisi ayrimi -> bir dersten once kisa bir ara varsa Ogretmen Girisi, yoksa - ilk ders veya uzun aradan sonra (ogle arasi gibi) - Giris). Ozet sayfasina Bugunku Zil Programi tablosu + siradaki zil satirina tur etiketi eklendi.
+- Ayni oturumda ayrica: /program sayfasina Sabit Ziller karti (ekle/sil, saat+aciklama+gunler), /ayarlar sayfasina ogrenci zili ayarlari (aktif/offset/max-bosluk) eklendi.
+- Production ders_programi.json'a sabit_ziller (08:00, 13:20) ve yeni ayarlar alanlari eklendi.

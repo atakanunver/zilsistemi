@@ -59,6 +59,13 @@ _VARSAYILAN_DERS_PROGRAMI = {
         },
         {"id": "hafta_sonu", "ad": "Hafta Sonu", "gunler": [6, 7], "dersler": []},
     ],
+    # Sabit (belirli bir derse bağlı olmayan) ziller — ör. gün başlangıcı/öğle sonrası
+    # öğrenci toplanma zili. Her biri kendi "gunler" listesine sahip (program günleriyle
+    # aynı ISO gün no'ları), o gün için bir program atanmışsa VE tatil değilse çalar.
+    "sabit_ziller": [
+        {"saat": "08:00", "aciklama": "Öğrenci toplanması", "gunler": [1, 2, 3, 4, 5]},
+        {"saat": "13:20", "aciklama": "Öğrenci toplanması (öğleden sonra)", "gunler": [1, 2, 3, 4, 5]},
+    ],
     "tatil_gunleri": [],
     "karsilama_muzigi": {"aktif": True, "baslama": "07:50", "durdurma": "07:55"},
     "ayarlar": {
@@ -66,6 +73,13 @@ _VARSAYILAN_DERS_PROGRAMI = {
         "tenefus_muzigi_aktif": True,
         "otomatik_ses_seviyesi": 50,
         "zil_ses_seviyesi": 80,
+        # Kısa teneffüslerde (ders çıkışı ile sonraki giriş arası ≤ ogrenci_zili_max_bosluk_dk
+        # olan aralar) çıkış zilinden ogrenci_zili_offset_dk dakika sonra ekstra bir "öğrenci
+        # zili" çalar (ör. 08:50 çıkış → 08:55 öğrenci zili → 09:00 giriş). Uzun aralar (öğle
+        # arası gibi) bu eşiği aştığı için otomatik olarak dışarıda kalır.
+        "ogrenci_zili_aktif": True,
+        "ogrenci_zili_offset_dk": 5,
+        "ogrenci_zili_max_bosluk_dk": 20,
     },
 }
 
@@ -76,7 +90,7 @@ TATIL_GUNLERI = set()
 OTOMATIK_SES_SEVIYESI = 50
 son_calinan_zil_dakikasi = None
 
-def _program_olaylarini_hesapla(program, karsilama):
+def _program_olaylarini_hesapla(program, karsilama, ayarlar):
     # Teneffüs çiftleri: her ardışık ders ikilisi için (bitiş, sonraki başlangıç) —
     # eski hardcoded TENEFUS_PROGRAMI mantığının aynısı, artık ders listesinden türetilmiş.
     # Müzik çıkıştan 3dk sonra başlar, girişe 2dk kala (hâlâ çalıyor VE otomatik başlatıldıysa) durur.
@@ -93,16 +107,33 @@ def _program_olaylarini_hesapla(program, karsilama):
         olaylar = olaylar + [{"baslama": karsilama["baslama"], "durdurma": karsilama["durdurma"]}]
     # Zil saatleri: tüm ders başlangıç/bitiş saatlerinin birleşimi (öğle arası için ayrı
     # bir nokta gerekmiyor — dersler[i].bitis ve dersler[i+1].baslangic zaten kümede).
-    zil_saatleri = sorted({d["baslangic"] for d in dersler} | {d["bitis"] for d in dersler})
-    return olaylar, zil_saatleri
+    zil_saatleri = {d["baslangic"] for d in dersler} | {d["bitis"] for d in dersler}
+    # Öğrenci zili (2026-09-18, kullanıcı isteği): kısa teneffüslerde ders çıkışından
+    # birkaç dakika sonra, girişten hemen önce ekstra bir uyarı zili — ör. 08:50 çıkış →
+    # (offset=5) 08:55 öğrenci zili → 09:00 giriş. Uzun aralar (öğle arası gibi) elenir.
+    if ayarlar.get("ogrenci_zili_aktif", True) and len(dersler) >= 2:
+        offset = ayarlar.get("ogrenci_zili_offset_dk", 5)
+        max_boslu = ayarlar.get("ogrenci_zili_max_bosluk_dk", 20)
+        for i in range(len(dersler) - 1):
+            cikis = datetime.strptime(dersler[i]["bitis"], "%H:%M")
+            giris = datetime.strptime(dersler[i + 1]["baslangic"], "%H:%M")
+            bosluk_dk = (giris - cikis).total_seconds() / 60
+            if 0 < bosluk_dk <= max_boslu:
+                zil_saatleri.add(saat_ekle(dersler[i]["bitis"], offset))
+    return olaylar, sorted(zil_saatleri)
 
 def _ders_programindan_turet(veri):
     karsilama = veri.get("karsilama_muzigi", {})
+    ayarlar = veri.get("ayarlar", {})
+    sabit_ziller = veri.get("sabit_ziller", [])
     gunluk = {}
     for program in veri["programlar"]:
-        olaylar, zil_saatleri = _program_olaylarini_hesapla(program, karsilama)
+        olaylar, zil_saatleri = _program_olaylarini_hesapla(program, karsilama, ayarlar)
         for gun in program.get("gunler", []):
-            gunluk[gun] = {"olaylar": olaylar, "zil_saatleri": zil_saatleri}
+            # Sabit ziller (ör. 08:00/13:20 öğrenci toplanması) — sadece bu güne atanmış
+            # olanlar eklenir; bir program o gün geçerliyse (ders var/yok fark etmez) çalar.
+            ek_ziller = {sz["saat"] for sz in sabit_ziller if gun in sz.get("gunler", [])}
+            gunluk[gun] = {"olaylar": olaylar, "zil_saatleri": sorted(set(zil_saatleri) | ek_ziller)}
     return gunluk
 
 def ders_programi_yukle_gerekirse():

@@ -8,7 +8,7 @@ import os
 import json
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import wraps
 from flask import Flask, request, Response, redirect, url_for, send_file, abort, jsonify
 
@@ -161,15 +161,46 @@ def _id_uret(ad, mevcut_idler):
     return aday
 
 
-def _gunluk_ozet_hesapla(veri, gun_iso):
-    # ozet() ve program() sayfalarında "bugün hangi program geçerli" göstermek için —
-    # sys.py'deki _ders_programindan_turet ile aynı mantığın hafifçe basitleştirilmişi
-    # (sadece zil_saatleri lazım, teneffüs olaylarına gerek yok).
+def _saat_ekle(saat_str, dakika):
+    t = datetime.strptime(saat_str, "%H:%M") + timedelta(minutes=dakika)
+    return t.strftime("%H:%M")
+
+
+def _zil_programi_hesapla(veri, gun_iso):
+    # ozet() sayfasında "bugünkü zil programı"nı katmanlı (öğrenci toplan / giriş /
+    # çıkış / öğrenci girişi / öğretmen girişi) etiketleriyle göstermek için — sys.py'deki
+    # _ders_programindan_turet ile aynı zaman mantığının, etiketli görüntüleme amaçlı
+    # bir tekrarı (2026-09-18, kullanıcı isteği: "zil katmanlı olsun").
+    ayarlar = veri.get("ayarlar", {})
+    sabit_ziller = veri.get("sabit_ziller", [])
+    offset = ayarlar.get("ogrenci_zili_offset_dk", 5)
+    max_boslu = ayarlar.get("ogrenci_zili_max_bosluk_dk", 20)
+    ogrenci_zili_aktif = ayarlar.get("ogrenci_zili_aktif", True)
+
     for p in veri.get("programlar", []):
-        if gun_iso in p.get("gunler", []):
-            dersler = sorted(p.get("dersler", []), key=lambda d: d["baslangic"])
-            zil_saatleri = sorted({d["baslangic"] for d in dersler} | {d["bitis"] for d in dersler})
-            return p, dersler, zil_saatleri
+        if gun_iso not in p.get("gunler", []):
+            continue
+        dersler = sorted(p.get("dersler", []), key=lambda d: d["baslangic"])
+        olaylar = []
+        for i, d in enumerate(dersler):
+            # Bu dersten önce (aynı gün, aynı programda) kısa bir teneffüs varsa "Öğretmen
+            # Girişi", yoksa (günün ilk dersi ya da uzun bir aradan sonraysa, ör. öğle
+            # arası) sıradan "Giriş" — çünkü o durumda hemen öncesinde bir "toplanma" zili var.
+            onceki_kisa_ara_var = False
+            if i > 0:
+                bosluk = (datetime.strptime(d["baslangic"], "%H:%M") - datetime.strptime(dersler[i - 1]["bitis"], "%H:%M")).total_seconds() / 60
+                onceki_kisa_ara_var = 0 < bosluk <= max_boslu
+            olaylar.append({"saat": d["baslangic"], "tur": "Öğretmen Girişi" if onceki_kisa_ara_var else "Giriş"})
+            olaylar.append({"saat": d["bitis"], "tur": "Çıkış"})
+            if ogrenci_zili_aktif and i < len(dersler) - 1:
+                bosluk = (datetime.strptime(dersler[i + 1]["baslangic"], "%H:%M") - datetime.strptime(d["bitis"], "%H:%M")).total_seconds() / 60
+                if 0 < bosluk <= max_boslu:
+                    olaylar.append({"saat": _saat_ekle(d["bitis"], offset), "tur": "Öğrenci Girişi"})
+        for sz in sabit_ziller:
+            if gun_iso in sz.get("gunler", []):
+                olaylar.append({"saat": sz["saat"], "tur": sz.get("aciklama") or "Öğrenci Toplanması"})
+        olaylar.sort(key=lambda o: o["saat"])
+        return p, dersler, olaylar
     return None, [], []
 
 
@@ -184,10 +215,10 @@ def ozet():
     tatil_gunleri = veri.get("tatil_gunleri", [])
     ayarlar = veri.get("ayarlar", {})
 
-    program_bugun, dersler, zil_saatleri = _gunluk_ozet_hesapla(veri, bugun_iso)
+    program_bugun, dersler, zil_programi = _zil_programi_hesapla(veri, bugun_iso)
     bugun_tatil = bugun_tarih in tatil_gunleri
     bugun_okul_gunu = program_bugun is not None and dersler and not bugun_tatil
-    sonraki = next((s for s in zil_saatleri if s > simdi_hhmm), None)
+    sonraki = next((o for o in zil_programi if o["saat"] > simdi_hhmm), None)
 
     def rozet(aktif, etiket):
         return f'<span class="badge {"on" if aktif else "off"}">{etiket}: {"Açık" if aktif else "Kapalı"}</span>'
@@ -197,7 +228,7 @@ def ozet():
     elif not program_bugun or not dersler:
         durum = "📅 Bugün için tanımlı bir program/ders yok — otomasyon çalışmaz."
     elif sonraki:
-        durum = f"⏰ Sıradaki zil: <b>{sonraki}</b> ({program_bugun['ad']})"
+        durum = f"⏰ Sıradaki zil: <b>{sonraki['saat']}</b> — {sonraki['tur']} ({program_bugun['ad']})"
     else:
         durum = f"Bugün ({program_bugun['ad']}) için kalan zil yok."
 
@@ -211,6 +242,10 @@ def ozet():
       {rozet(ayarlar.get('tenefus_muzigi_aktif', True), 'Teneffüs müziği')}
       {rozet(os.path.exists(ZIL_SESI_DOSYASI), 'zil_sesi.mp3 mevcut')}
       <div class="small" style="margin-top:10px">Zil ses seviyesi: %{ayarlar.get('zil_ses_seviyesi', 80)} · Otomatik ses seviyesi: %{ayarlar.get('otomatik_ses_seviyesi', 50)}</div>
+    </div>
+    <div class="card">
+      <h2 style="margin-top:0">Bugünkü Zil Programı</h2>
+      {"<table><tr><th>Saat</th><th>Tür</th></tr>" + "".join(f'<tr><td>{o["saat"]}</td><td>{"➡️ " + o["tur"] if sonraki and o["saat"] == sonraki["saat"] else o["tur"]}</td></tr>' for o in zil_programi) + "</table>" if zil_programi else '<p class="small">Bugün için zil programı yok.</p>'}
     </div>
     <div class="card">
       <h2 style="margin-top:0">Tanımlı Programlar</h2>
@@ -284,6 +319,28 @@ def program():
                 ders_programi_yaz(veri)
                 mesaj = "Karşılama müziği ayarları kaydedildi."
 
+            elif islem == "sabit_zil_ekle":
+                saat = request.form.get("yeni_sabit_zil_saat", "").strip()
+                aciklama = request.form.get("yeni_sabit_zil_aciklama", "").strip() or "Sabit zil"
+                gunler = sorted(int(g) for g in request.form.getlist("yeni_sabit_zil_gun"))
+                if not SAAT_RE.match(saat):
+                    raise ValueError("Geçersiz saat formatı (HH:MM).")
+                if not gunler:
+                    raise ValueError("En az bir gün seçilmeli.")
+                sabit_ziller = veri.setdefault("sabit_ziller", [])
+                sabit_ziller.append({"saat": saat, "aciklama": aciklama, "gunler": gunler})
+                sabit_ziller.sort(key=lambda z: z["saat"])
+                ders_programi_yaz(veri)
+                mesaj = f"Sabit zil eklendi: {saat} — {aciklama}"
+
+            elif islem == "sabit_zil_sil":
+                indeks = int(request.form.get("indeks", -1))
+                sabit_ziller = veri.get("sabit_ziller", [])
+                if 0 <= indeks < len(sabit_ziller):
+                    silinen = sabit_ziller.pop(indeks)
+                    ders_programi_yaz(veri)
+                    mesaj = f"Sabit zil kaldırıldı: {silinen['saat']} — {silinen.get('aciklama','')}"
+
             elif islem == "program_ekle":
                 ad = request.form.get("yeni_program_adi", "").strip()
                 if not ad:
@@ -328,6 +385,7 @@ def program():
 
     tatil_gunleri = sorted(veri.get("tatil_gunleri", []))
     karsilama = veri.get("karsilama_muzigi", {})
+    sabit_ziller = veri.get("sabit_ziller", [])
     tum_atanmis_gunler = set()
     for p in veri["programlar"]:
         tum_atanmis_gunler |= set(p.get("gunler", []))
@@ -412,6 +470,27 @@ def program():
           <div><label>Durdurma</label><input type="time" name="karsilama_durdurma" value="{karsilama.get('durdurma','07:55')}"></div>
         </div>
         <button type="submit">Kaydet</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <h2 style="margin-top:0">Sabit Ziller</h2>
+      <p class="small">Belirli bir derse bağlı olmayan, sabit saatte çalan ziller — ör. gün başında veya öğle arası sonrasında öğrenci toplanma zili. (Teneffüsler arasındaki "öğrenci zili" ayrı bir ayar — bkz. <a class="link" href="/ayarlar">Ayarlar</a>.)</p>
+      {"".join(f'''
+      <div class="row" style="align-items:center">
+        <div style="flex:0;min-width:60px"><b>{z["saat"]}</b></div>
+        <div>{z.get("aciklama","")} <span class="small">({", ".join(GUN_ADLARI.get(g,"?") for g in z.get("gunler",[]))})</span></div>
+        <div style="flex:0"><form method="post" style="margin:0"><input type="hidden" name="islem" value="sabit_zil_sil"><input type="hidden" name="indeks" value="{i}"><button type="submit" class="danger">Sil</button></form></div>
+      </div>''' for i, z in enumerate(sabit_ziller)) or '<p class="small">Sabit zil tanımlanmamış.</p>'}
+      <form method="post" style="margin-top:12px">
+        <input type="hidden" name="islem" value="sabit_zil_ekle">
+        <div class="row">
+          <div style="max-width:120px"><label>Saat</label><input type="time" name="yeni_sabit_zil_saat" required></div>
+          <div><label>Açıklama</label><input type="text" name="yeni_sabit_zil_aciklama" placeholder="ör. Öğrenci toplanması"></div>
+        </div>
+        {"".join(f'<label class="gun-toggle"><input type="checkbox" name="yeni_sabit_zil_gun" value="{g}" checked> {ad}</label>' for g, ad in GUN_ADLARI.items() if g <= 5)}
+        {"".join(f'<label class="gun-toggle"><input type="checkbox" name="yeni_sabit_zil_gun" value="{g}"> {ad}</label>' for g, ad in GUN_ADLARI.items() if g > 5)}
+        <div style="margin-top:8px"><button type="submit" class="secondary">Sabit Zil Ekle</button></div>
       </form>
     </div>
 
@@ -511,6 +590,9 @@ def ayarlar_sayfasi():
         ayarlar["tenefus_muzigi_aktif"] = request.form.get("tenefus_muzigi_aktif") == "on"
         ayarlar["otomatik_ses_seviyesi"] = max(0, min(100, int(request.form.get("otomatik_ses_seviyesi", 50) or 50)))
         ayarlar["zil_ses_seviyesi"] = max(0, min(100, int(request.form.get("zil_ses_seviyesi", 80) or 80)))
+        ayarlar["ogrenci_zili_aktif"] = request.form.get("ogrenci_zili_aktif") == "on"
+        ayarlar["ogrenci_zili_offset_dk"] = max(1, min(30, int(request.form.get("ogrenci_zili_offset_dk", 5) or 5)))
+        ayarlar["ogrenci_zili_max_bosluk_dk"] = max(1, min(120, int(request.form.get("ogrenci_zili_max_bosluk_dk", 20) or 20)))
         veri["ayarlar"] = ayarlar
         ders_programi_yaz(veri)
         mesaj = "Ayarlar kaydedildi."
@@ -532,6 +614,15 @@ def ayarlar_sayfasi():
         <label>Otomatik (teneffüs/karşılama) ses seviyesi: %{a.get('otomatik_ses_seviyesi', 50)}</label>
         <input type="range" min="0" max="100" name="otomatik_ses_seviyesi" value="{a.get('otomatik_ses_seviyesi', 50)}"
           oninput="this.previousElementSibling.textContent='Otomatik (teneffüs/karşılama) ses seviyesi: %'+this.value">
+      </div>
+      <div class="card">
+        <h2 style="margin-top:0">Öğrenci Zili</h2>
+        <p class="small">Kısa teneffüslerde (ders çıkışı ile sonraki giriş arası belirlenen eşiğin altındaysa) çıkış zilinden birkaç dakika sonra ekstra bir uyarı zili çalar — ör. 08:50 çıkış → 08:55 öğrenci zili → 09:00 giriş. Uzun aralar (öğle arası gibi) otomatik olarak hariç tutulur.</p>
+        <label class="gun-toggle"><input type="checkbox" name="ogrenci_zili_aktif" {"checked" if a.get('ogrenci_zili_aktif', True) else ""}> Öğrenci zili aktif</label>
+        <div class="row" style="margin-top:10px">
+          <div><label>Kaç dakika sonra çalsın</label><input type="number" min="1" max="30" name="ogrenci_zili_offset_dk" value="{a.get('ogrenci_zili_offset_dk', 5)}"></div>
+          <div><label>Bu süreden uzun aralarda uygulanmasın (dk)</label><input type="number" min="1" max="120" name="ogrenci_zili_max_bosluk_dk" value="{a.get('ogrenci_zili_max_bosluk_dk', 20)}"></div>
+        </div>
       </div>
       <button type="submit">Kaydet</button>
     </form>
