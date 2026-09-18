@@ -1,7 +1,7 @@
 # Gerçek Zil Sesi + Web Dashboard (Ders Programı / Zil Sesi / Teneffüs Yönetimi)
 
 **Tarih:** 2026-09-18
-**Durum:** Onaylandı, uygulama planına geçiliyor.
+**Durum:** Faz A uygulandı ve production'a alındı (bkz. altta "Faz A Güncellemesi — Tatil Günleri"). Faz B-D henüz uygulanmadı.
 **Proje:** `/home/atakan/ses` (zil sunucusu, 192.168.23.230)
 
 ## Kapsam
@@ -56,6 +56,7 @@ Kapsam dışı (bilinçli, 2026-09-18'de kullanıcı kararı):
     {"no": 8, "baslangic": "15:10", "bitis": "15:50"}
   ],
   "ders_gunleri": [1, 2, 3, 4, 5],
+  "tatil_gunleri": ["2026-10-29", "2026-11-24"],
   "karsilama_muzigi": {"aktif": true, "baslama": "07:50", "durdurma": "07:55"},
   "ayarlar": {
     "zil_aktif": true,
@@ -94,7 +95,9 @@ her 30 saniyede:
 
 **Sayfalar:**
 1. `GET /` — Özet: bugünün programı, sıradaki zil saati, mevcut ayarların durumu (aktif/pasif rozetleri).
-2. `GET/POST /program` — Ders programı editörü: `dersler` listesi (no/başlangıç/bitiş), `ders_gunleri`, `karşılama_muzigi`. Kaydetmeden önce doğrulama: `HH:MM` formatı, `bitis > baslangic`, ardışık dersler çakışmıyor. Kayıt atomik (`ders_programi.json.tmp` yaz, `os.replace`).
+2. `GET/POST /program` — Ders programı editörü: `dersler` listesi (no/başlangıç/bitiş), `karşılama_muzigi`. Kaydetmeden önce doğrulama: `HH:MM` formatı, `bitis > baslangic`, ardışık dersler çakışmıyor. Kayıt atomik (`ders_programi.json.tmp` yaz, `os.replace`).
+   - **`ders_gunleri`**: haftanın 7 günü (Pazartesi–Pazar) için ayrı aç/kapa toggle olarak gösterilir — sadece hafta içi değil, istenirse hafta sonu da açılabilir (2026-09-18, kullanıcı isteği). Değer olarak seçili günlerin ISO gün numaraları (`1`=Pazartesi...`7`=Pazar) `ders_gunleri` listesine yazılır.
+   - **`tatil_gunleri`**: takvimden gün(ler) seçilerek eklenen/çıkarılan tarih listesi (`YYYY-AA-GG`, `<input type="date">` + "ekle"/"listeden sil" butonları — ayrı bir tam takvim widget'ı şart değil). Bu listedeki bir tarihte `ders_gunleri`'nde olsa dahi zil/teneffüs otomasyonu o gün tamamen devre dışı kalır (`sys.py`'de zaten uygulandı, bkz. altta).
 3. `GET/POST /zil-sesi` — Dosya yükleme (mp3), yüklenen dosya `<audio controls>` ile tarayıcıda önizlenir, onaylanınca `zil_sesi.mp3.tmp` → `os.replace` ile `zil_sesi.mp3` üzerine yazılır.
 4. `GET/POST /ayarlar` — `zil_aktif`, `tenefus_muzigi_aktif` toggle'ları, `otomatik_ses_seviyesi` / `zil_ses_seviyesi` slider'ları (0-100).
 5. `GET /playlist` + `POST /playlist/sil` — `PLAYLIST_DIR` dosya listesi (ad, boyut), silme butonu (`os.path.basename` ile path traversal engellenir, `/sil` komutundaki güvenlik deseninin aynısı).
@@ -117,3 +120,12 @@ her 30 saniyede:
 4. **Faz D — Playlist yönetimi**: `/playlist` listeleme + silme.
 
 Detaylı adım adım uygulama planı `writing-plans` süreciyle ayrıca çıkarılacak.
+
+## Faz A Güncellemesi — Tatil Günleri (2026-09-18, aynı gün içinde eklendi)
+
+Kullanıcı isteği: haftanın 7 günü için zil/teneffüs ayarı web'den yapılabilsin, belirli günler (resmi tatil vb.) takvimden işaretlenip o günlerde zil tamamen kapatılabilsin.
+
+- `ders_programi.json`'a `tatil_gunleri` alanı eklendi: `["YYYY-AA-GG", ...]` formatında, boş başlar.
+- `sys.py`'de `ders_programi_yukle_gerekirse()` bu listeyi `TATIL_GUNLERI` (set) olarak tutuyor; `tenefus_otomasyonu()`'nda gün kontrolü artık `isoweekday() in ders_gunleri and bugünün_tarihi not in TATIL_GUNLERI` şeklinde — tatil günü ise zil, teneffüs müziği ve karşılama müziğinin **hepsi** o gün boyunca devre dışı kalıyor (duyuru_otomasyonu etkilenmiyor, o zaten tarihli/tek seferlik ve hafta içi kısıtı yok).
+- Bu, dashboard'un `/program` sayfasındaki 7-gün-toggle + takvim gereksinimiyle birlikte yukarıda güncellendi. Faz B uygulanırken bu alanın zaten `sys.py` tarafında okunduğu unutulmamalı — sadece dashboard UI'ı eksik.
+- Deploy: aynı gün (2026-09-18, ~09:01) production'a alındı, `ses_bot.service`'e ayrıca `PYTHONUNBUFFERED=1` eklendi (log gecikmesi sorununu çözmek için, davranış değişikliği yok).

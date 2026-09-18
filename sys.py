@@ -46,6 +46,7 @@ _VARSAYILAN_DERS_PROGRAMI = {
         {"no": 8, "baslangic": "15:10", "bitis": "15:50"},
     ],
     "ders_gunleri": [1, 2, 3, 4, 5],
+    "tatil_gunleri": [],
     "karsilama_muzigi": {"aktif": True, "baslama": "07:50", "durdurma": "07:55"},
     "ayarlar": {
         "zil_aktif": True,
@@ -59,6 +60,7 @@ ders_programi = {}
 ders_programi_mtime = None
 TENEFUS_OLAYLARI = []
 ZIL_SAATLERI = set()
+TATIL_GUNLERI = set()
 OTOMATIK_SES_SEVIYESI = 50
 son_calinan_zil_dakikasi = None
 
@@ -81,7 +83,7 @@ def _ders_programindan_turet(veri):
 
 def ders_programi_yukle_gerekirse():
     # sys.py 30sn'de bir çağırır; dosya değişmediyse hiçbir şey yapmaz (mtime kontrolü).
-    global ders_programi, ders_programi_mtime, TENEFUS_OLAYLARI, ZIL_SAATLERI, OTOMATIK_SES_SEVIYESI
+    global ders_programi, ders_programi_mtime, TENEFUS_OLAYLARI, ZIL_SAATLERI, TATIL_GUNLERI, OTOMATIK_SES_SEVIYESI
     try:
         mtime = os.path.getmtime(DERS_PROGRAMI_DOSYASI)
     except OSError:
@@ -107,6 +109,9 @@ def ders_programi_yukle_gerekirse():
     ders_programi_mtime = mtime
     TENEFUS_OLAYLARI = olaylar
     ZIL_SAATLERI = zil_saatleri
+    # Tatil günleri: "YYYY-AA-GG" formatında tarihler — takvimden işaretlenen bu günlerde
+    # ders_gunleri'nde olsa bile zil/teneffüs otomasyonu tamamen devre dışı kalır.
+    TATIL_GUNLERI = set(veri.get("tatil_gunleri", []))
     OTOMATIK_SES_SEVIYESI = veri.get("ayarlar", {}).get("otomatik_ses_seviyesi", 50)
 
 ders_programi_yukle_gerekirse()
@@ -193,7 +198,8 @@ async def tenefus_otomasyonu():
         ders_programi_yukle_gerekirse()
         simdi_dt = datetime.now()
         ders_gunleri = ders_programi.get("ders_gunleri", [1, 2, 3, 4, 5])
-        if simdi_dt.isoweekday() in ders_gunleri:
+        bugun_tatil = simdi_dt.strftime("%Y-%m-%d") in TATIL_GUNLERI
+        if simdi_dt.isoweekday() in ders_gunleri and not bugun_tatil:
             simdi = simdi_dt.strftime("%H:%M")
             ayarlar = ders_programi.get("ayarlar", {})
 

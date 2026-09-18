@@ -13,3 +13,10 @@
 - Farabi ile hicbir canli baglanti/SSH/senkron yok (kullanici karari, 2026-09-18) - ders_programi.json tek seferlik Farabi'nin zil.json'undan elle kopyalanip artik bagimsiz, ileride web dashboard'dan yonetilecek.
 - Deploy: sys.py + ders_programi.json production'a 08:52'de alindi, ses_bot.service restart edildi, teneffus tetikleme anini (08:53) hatasiz gecti.
 - Sirada: writing-plans ile detayli uygulama plani + Faz B (Flask+waitress dashboard iskeleti, port 8090).
+
+## 2026-09-18 - Tatil gunleri destegi + PYTHONUNBUFFERED
+
+- Kullanici istegi: haftanin 7 gunu icin zil ayari web'den yapilabilsin, belirli gunler (tatil) takvimden isaretlenip o gun zil tamamen kapatilabilsin.
+- ders_programi.json'a tatil_gunleri (['YYYY-AA-GG',...]) eklendi, sys.py bunu TATIL_GUNLERI set'ine yukluyor, tenefus_otomasyonu() gun kontrolune 'bugun tatil degilse' sarti eklendi (zil+tenefus+karsilama muzigi hepsi o gun devre disi kaliyor, duyuru_otomasyonu etkilenmiyor).
+- ses_bot.service'e PYTHONUNBUFFERED=1 eklendi - print() ciktilari journalctl'de aninda gorunuyor artik (onceden process restart/exit'e kadar buffer'da bekliyordu, debug'i zorlastiriyordu). Davranis degisikligi yok, sadece log gorunurlugu.
+- Spec dosyasi (docs/superpowers/specs/2026-09-18-zil-dashboard-design.md) guncellendi: /program sayfasi artik 7-gun-toggle + tatil takvimi iceriyor.
