@@ -7,9 +7,10 @@ atomik os.replace yazımıyla) — bkz. docs/superpowers/specs/2026-09-18-zil-da
 import os
 import json
 import re
+import uuid
 from datetime import datetime
 from functools import wraps
-from flask import Flask, request, Response, redirect, url_for, send_file, abort
+from flask import Flask, request, Response, redirect, url_for, send_file, abort, jsonify
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PLAYLIST_DIR = os.path.join(BASE_DIR, "playlist")
@@ -17,6 +18,10 @@ DERS_PROGRAMI_DOSYASI = os.path.join(BASE_DIR, "ders_programi.json")
 ZIL_SESI_DOSYASI = os.path.join(BASE_DIR, "zil_sesi.mp3")
 ZIL_SESI_GECICI = os.path.join(BASE_DIR, "zil_sesi.mp3.tmp")
 ENV_DOSYASI = os.path.join(BASE_DIR, "env.txt")
+# sys.py ile paylaşılan dosya-tabanlı komut kanalı (bkz. sys.py'deki etkinlik_dinleyici()).
+OYNATMA_ISTEGI_DOSYASI = os.path.join(BASE_DIR, "oynatma_istegi.json")
+OYNATMA_DURUMU_DOSYASI = os.path.join(BASE_DIR, "oynatma_durumu.json")
+YOUTUBE_LINK_RE = re.compile(r"(https?://)?(www\.|m\.|music\.)?(youtube\.com|youtu\.be)/\S+", re.IGNORECASE)
 
 GUN_ADLARI = {1: "Pazartesi", 2: "Salı", 3: "Çarşamba", 4: "Perşembe", 5: "Cuma", 6: "Cumartesi", 7: "Pazar"}
 SAAT_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
@@ -132,6 +137,7 @@ def sayfa(baslik, icerik, mesaj=None, hata=None):
   <a href="/zil-sesi" class="{'active' if baslik=='Zil Sesi' else ''}">Zil Sesi</a>
   <a href="/ayarlar" class="{'active' if baslik=='Ayarlar' else ''}">Ayarlar</a>
   <a href="/playlist" class="{'active' if baslik=='Playlist' else ''}">Playlist</a>
+  <a href="/youtube-cal" class="{'active' if baslik=='YouTube Çal' else ''}">🎉 YouTube Çal</a>
 </nav>
 <main>
   <h1>{baslik}</h1>
@@ -563,6 +569,94 @@ def playlist_sil():
         if os.path.exists(yol):
             os.remove(yol)
     return redirect(url_for("playlist_sayfasi"))
+
+
+# --- /youtube-cal : etkinlik (kermes/festival) icin YouTube link/playlist'ini dogrudan
+# hoparlorden calmak (indirme yok, streaming) - playlist/'e hic dokunmaz, tenefus
+# otomasyonuyla karismaz. sys.py'deki etkinlik_dinleyici() ile dosya-tabanli komut
+# kanaliyla haberlesir (bkz. OYNATMA_ISTEGI_DOSYASI / OYNATMA_DURUMU_DOSYASI).
+@app.route("/youtube-cal", methods=["GET"])
+@yetki_gerekli
+def youtube_cal_sayfasi():
+    icerik = """
+    <div class="card">
+      <p class="small">Kermes/festival gibi etkinliklerde kullanmak için — bir YouTube video veya playlist linki
+      yapıştırın, doğrudan zil sunucusunun hoparlöründen çalınmaya başlar (indirme yok, playlist/ klasörüne
+      dokunmaz, teneffüs otomasyonuna karışmaz). Playlist ise şarkılar sırayla, kendiliğinden bir sonrakine
+      geçilerek çalınır.</p>
+      <form id="cal-form" class="row">
+        <div><label>YouTube video veya playlist linki</label><input type="text" id="youtube-url" placeholder="https://www.youtube.com/playlist?list=..." required></div>
+        <div style="flex:0"><button type="submit">▶️ Çal</button></div>
+      </form>
+      <form id="durdur-form" style="margin-top:8px">
+        <button type="submit" class="danger">⏹ Durdur</button>
+      </form>
+    </div>
+    <div class="card">
+      <h2 style="margin-top:0">Durum</h2>
+      <div id="durum-alani" class="small">Yükleniyor...</div>
+    </div>
+    <script>
+    function durumGuncelle(d) {
+      var el = document.getElementById('durum-alani');
+      if (!d || d.durum === 'bos') { el.textContent = 'Henüz bir şey çalınmadı.'; return; }
+      if (d.durum === 'calindi') { el.textContent = '▶️ Çalınıyor: ' + d.baslik + ' (' + d.sira + '/' + d.toplam + ')'; return; }
+      if (d.durum === 'atlandi') { el.textContent = '⚠️ Parça atlandı (' + d.sira + '/' + d.toplam + '): ' + (d.hata_mesaji || ''); return; }
+      if (d.durum === 'tamamlandi') { el.textContent = '✅ Kuyruk tamamlandı.'; return; }
+      if (d.durum === 'durduruldu') { el.textContent = '⏹ Durduruldu.'; return; }
+      if (d.durum === 'hata') { el.textContent = '❌ Hata: ' + (d.hata_mesaji || ''); return; }
+      el.textContent = JSON.stringify(d);
+    }
+    function durumCek() {
+      fetch('/youtube-cal/durum', {credentials: 'same-origin'})
+        .then(function(r){ return r.json(); })
+        .then(durumGuncelle)
+        .catch(function(e){ document.getElementById('durum-alani').textContent = '⚠️ Durum alınamadı: ' + e; });
+    }
+    document.getElementById('cal-form').addEventListener('submit', function(e) {
+      e.preventDefault();
+      var url = document.getElementById('youtube-url').value;
+      fetch('/youtube-cal/baslat', {method: 'POST', credentials: 'same-origin', headers: {'Content-Type': 'application/x-www-form-urlencoded'}, body: 'url=' + encodeURIComponent(url)})
+        .then(function(){ document.getElementById('durum-alani').textContent = 'Başlatılıyor...'; setTimeout(durumCek, 1000); });
+    });
+    document.getElementById('durdur-form').addEventListener('submit', function(e) {
+      e.preventDefault();
+      fetch('/youtube-cal/durdur', {method: 'POST', credentials: 'same-origin'}).then(function(){ setTimeout(durumCek, 1000); });
+    });
+    durumCek();
+    setInterval(durumCek, 3000);
+    </script>
+    """
+    return sayfa("YouTube Çal", icerik)
+
+
+@app.route("/youtube-cal/baslat", methods=["POST"])
+@yetki_gerekli
+def youtube_cal_baslat():
+    url = request.form.get("url", "").strip()
+    if not YOUTUBE_LINK_RE.search(url):
+        return jsonify({"tamam": False, "hata": "Geçerli bir YouTube linki değil."}), 400
+    istek = {"istek_id": str(uuid.uuid4()), "komut": "cal", "url": url}
+    _atomik_yaz(OYNATMA_ISTEGI_DOSYASI, json.dumps(istek, ensure_ascii=False).encode("utf-8"))
+    return jsonify({"tamam": True})
+
+
+@app.route("/youtube-cal/durdur", methods=["POST"])
+@yetki_gerekli
+def youtube_cal_durdur():
+    istek = {"istek_id": str(uuid.uuid4()), "komut": "durdur"}
+    _atomik_yaz(OYNATMA_ISTEGI_DOSYASI, json.dumps(istek, ensure_ascii=False).encode("utf-8"))
+    return jsonify({"tamam": True})
+
+
+@app.route("/youtube-cal/durum", methods=["GET"])
+@yetki_gerekli
+def youtube_cal_durum():
+    try:
+        with open(OYNATMA_DURUMU_DOSYASI, "r", encoding="utf-8") as f:
+            return jsonify(json.load(f))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return jsonify({"durum": "bos"})
 
 
 if __name__ == "__main__":

@@ -26,3 +26,11 @@ yedek/
 # Dashboard atomik yazim gecici dosyalari
 *.tmp
 *.tmp-yazim
+
+# Etkinlik oynatma komut kanali (calisma zamani durumu, versiyonlanmaz)
+oynatma_istegi.json
+oynatma_durumu.json
+youtube_cookies.txt
+
+# YouTube indirme onbellegi (gecici, versiyonlanmaz)
+youtube_cache/

@@ -4,6 +4,7 @@ import re
 import json
 import time
 import ssl
+import uuid
 import httpx
 import warnings
 import vlc
@@ -376,16 +377,39 @@ async def control_volume(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 YOUTUBE_LINK_RE = re.compile(r'(https?://)?(www\.|m\.|music\.)?(youtube\.com|youtu\.be)/\S+', re.IGNORECASE)
 
-def youtube_ses_url_al(url):
+# Okul LAN'ının güvenlik duvarı bu sunucudan YouTube'un CDN'ine (googlevideo.com) doğrudan
+# TLS bağlantısı kurulmasını engelliyor (2026-09-18'de doğrulandı: VLC "TLS handshake:
+# Connection reset by peer" / "Network is unreachable" ile başarısız oluyordu — yt-dlp'nin
+# nocheckcertificate'i ve VLC'nin :gnutls-verify-trust=0'ı bile bunu çözmedi, sertifika
+# değil bağlantının kendisi engelleniyor). Ama yt-dlp'nin KENDİ indirme mekanizması çalışıyor
+# (aynı doğrulamada: eski yt-dlp 2026.3.17 "403 Forbidden" veriyordu, 2026.8.19'a yükseltince
+# düzeldi — YouTube'un bot-koruması ile ilgiliymiş, ağ engeliyle ilgisi yokmuş). Bu yüzden
+# VLC'ye asla ham CDN akış URL'si verilmiyor: önce yt-dlp ile geçici bir dosyaya indirilip
+# VLC o YEREL dosyayı çalıyor (playlist/'teki mp3'leri çalmasıyla aynı, ağ gerektirmez).
+YOUTUBE_CACHE_DIR = os.path.join(BASE_DIR, "youtube_cache")
+os.makedirs(YOUTUBE_CACHE_DIR, exist_ok=True)
+_son_youtube_gecici_dosya = None
+
+def youtube_indir(url):
+    global _son_youtube_gecici_dosya
+    if _son_youtube_gecici_dosya and os.path.exists(_son_youtube_gecici_dosya):
+        try:
+            os.remove(_son_youtube_gecici_dosya)
+        except OSError:
+            pass
     ydl_opts = {
         'format': 'bestaudio/best',
         'noplaylist': True,
         'quiet': True,
         'no_warnings': True,
+        'nocheckcertificate': True,
+        'outtmpl': os.path.join(YOUTUBE_CACHE_DIR, f"{uuid.uuid4()}.%(ext)s"),
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        return info['url'], info.get('title', 'YouTube Video')
+        info = ydl.extract_info(url, download=True)
+        dosya_yolu = ydl.prepare_filename(info)
+    _son_youtube_gecici_dosya = dosya_yolu
+    return dosya_yolu, info.get('title', 'YouTube Video')
 
 async def youtube_link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Komut değil: mesaj metninde YouTube linki geçiyorsa direkt çalar (2026-09-16, kullanıcı isteği)
@@ -396,16 +420,132 @@ async def youtube_link_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     url = eslesme.group(0)
 
-    durum_mesaji = await update.message.reply_text("🌐 YouTube bağlantısı kuruluyor...")
+    durum_mesaji = await update.message.reply_text("🌐 YouTube'dan indiriliyor...")
     try:
-        audio_url, baslik = youtube_ses_url_al(url)
-        player.set_media(instance.media_new(audio_url))
+        dosya_yolu, baslik = youtube_indir(url)
+        player.set_media(instance.media_new(dosya_yolu))
         player.play()
         player.audio_set_volume(OTOMATIK_SES_SEVIYESI)  # bu özellik için sabit %50 istendi
         otomatik_calan = False
         await durum_mesaji.edit_text(f"▶️ Oynatılıyor (%{OTOMATIK_SES_SEVIYESI} ses): {baslik}")
     except Exception as e:
         await durum_mesaji.edit_text(f"❌ YouTube Hatası: {str(e)[:100]}")
+
+# --- Etkinlik oynatma kuyruğu (dashboard'dan tetiklenir, 2026-09-18) ---
+# Kermes/festival gibi etkinliklerde kullanıcının kendi YouTube playlist'ini (veya tek
+# video linkini) dashboard'dan yapıştırıp doğrudan hoparlörden çaldırabilmesi için.
+# İndirilen dosyalar geçici (YOUTUBE_CACHE_DIR, playlist ile ilgisi yok) — playlist/
+# klasörüne hiç dokunmuyor, teneffüs otomasyonunun rastgele seçimine karışmıyor
+# (bilinçli, kullanıcı isteği: "etkinlikler kermes festival tarzı için, teneffüslerde
+# çalması için değil").
+# dashboard.py ile bu process arasında canlı IPC yok (proje kuralı, ders_programi.json'la
+# aynı desen) — basit bir dosya-tabanlı komut kanalı: dashboard oynatma_istegi.json'a
+# yazar, burada 3sn'de bir okunup işlenir, sonuç oynatma_durumu.json'a yazılır (dashboard
+# bunu polling'ler).
+OYNATMA_ISTEGI_DOSYASI = os.path.join(BASE_DIR, "oynatma_istegi.json")
+OYNATMA_DURUMU_DOSYASI = os.path.join(BASE_DIR, "oynatma_durumu.json")
+
+etkinlik_kuyrugu = []
+etkinlik_indeks = 0
+etkinlik_calisiyor = False
+_son_istek_id = None
+
+def _oynatma_durumu_yaz(veri):
+    tmp = OYNATMA_DURUMU_DOSYASI + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(veri, f, ensure_ascii=False)
+    os.replace(tmp, OYNATMA_DURUMU_DOSYASI)
+
+def _youtube_kuyruk_cikar(url):
+    # extract_flat=True: her videoyu tek tek çözmeden hızlıca id/başlık listesi alır
+    # (playlist linkiyse entries döner, tek video linkiyse tek kayıt döner). Her parçanın
+    # gerçek indirmesi (youtube_indir) çalınmadan hemen önce, tek tek yapılıyor.
+    ydl_opts = {'extract_flat': True, 'quiet': True, 'no_warnings': True, 'nocheckcertificate': True}
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    if info.get('entries'):
+        kayitlar = [e for e in info['entries'] if e]
+        return [f"https://www.youtube.com/watch?v={e['id']}" for e in kayitlar if e.get('id')]
+    return [url]
+
+def _etkinlik_parca_cal(sira_no):
+    global otomatik_calan
+    dosya_yolu, baslik = youtube_indir(etkinlik_kuyrugu[sira_no])
+    player.set_media(instance.media_new(dosya_yolu))
+    player.play()
+    player.audio_set_volume(current_volume)
+    otomatik_calan = False
+    _oynatma_durumu_yaz({
+        "durum": "calindi", "baslik": baslik,
+        "sira": sira_no + 1, "toplam": len(etkinlik_kuyrugu),
+    })
+    print(f"🎉 Etkinlik oynatma: {baslik} ({sira_no + 1}/{len(etkinlik_kuyrugu)})")
+
+async def etkinlik_dinleyici():
+    global etkinlik_kuyrugu, etkinlik_indeks, etkinlik_calisiyor, _son_istek_id
+    while True:
+        # 1) Dashboard'dan yeni bir istek geldi mi? (istek_id her tıklamada değişir)
+        try:
+            with open(OYNATMA_ISTEGI_DOSYASI, "r", encoding="utf-8") as f:
+                istek = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            istek = None
+
+        if istek and istek.get("istek_id") != _son_istek_id:
+            _son_istek_id = istek["istek_id"]
+            # İşlenen istek hemen silinir — yoksa servis restart olduğunda (_son_istek_id
+            # bellekte sıfırlanır) eski istek "yeni" sanılıp tekrar çalınır (2026-09-18'de
+            # canlı derste yakalandı: bir önceki test isteği restart sonrası kendiliğinden
+            # tekrar başlamıştı). Dashboard zaten her tıklamada yeni bir dosya yazıyor.
+            try:
+                os.remove(OYNATMA_ISTEGI_DOSYASI)
+            except OSError:
+                pass
+            if istek.get("komut") == "durdur":
+                player.stop()
+                etkinlik_kuyrugu, etkinlik_indeks, etkinlik_calisiyor = [], 0, False
+                _oynatma_durumu_yaz({"durum": "durduruldu"})
+                print("🛑 Etkinlik oynatma durduruldu (dashboard isteği).")
+            elif istek.get("komut") == "cal":
+                url = istek.get("url", "")
+                try:
+                    kuyruk = _youtube_kuyruk_cikar(url)
+                    if not kuyruk:
+                        raise ValueError("Listede video bulunamadı.")
+                    etkinlik_kuyrugu, etkinlik_indeks, etkinlik_calisiyor = kuyruk, 0, True
+                    _etkinlik_parca_cal(0)
+                except Exception as e:
+                    etkinlik_calisiyor = False
+                    _oynatma_durumu_yaz({"durum": "hata", "hata_mesaji": str(e)[:200]})
+                    print(f"⚠️ Etkinlik oynatma hatası: {e}")
+
+        # 2) Kuyrukta bir sonraki parçaya geçiş (mevcut parça kendiliğinden bittiyse).
+        # DİKKAT: "not player.is_playing()" burada YANLIŞ olurdu — play() çağrıldıktan
+        # hemen sonra akış henüz buffer'lanıyor olabilir ve is_playing() kısa süre False
+        # döner, bu da parçayı anında "bitti" sanıp bir sonrakine atlamaya yol açar
+        # (2026-09-18'de canlı testte yakalandı: 3.5dk'lık şarkı aynı saniyede "bitti"
+        # görünmüştü). Bunun yerine VLC'nin kendi state makinesi kullanılıyor: sadece
+        # gerçekten Ended (doğal bitiş) veya Error (akış açılamadı) durumunda ilerlenir;
+        # Opening/Buffering/Playing/Paused durumlarında dokunulmaz.
+        # Bir parça çözülemez/çalınamazsa (ör. kaldırılmış video) atlanıp bir sonraki
+        # döngüde (3sn sonra) otomatik olarak sıradakine geçilir — tüm kuyruğu iptal etmez.
+        if etkinlik_calisiyor and player.get_state() in (vlc.State.Ended, vlc.State.Error):
+            etkinlik_indeks += 1
+            if etkinlik_indeks < len(etkinlik_kuyrugu):
+                try:
+                    _etkinlik_parca_cal(etkinlik_indeks)
+                except Exception as e:
+                    print(f"⚠️ Etkinlik parçası atlandı ({etkinlik_indeks + 1}/{len(etkinlik_kuyrugu)}): {e}")
+                    _oynatma_durumu_yaz({
+                        "durum": "atlandi", "sira": etkinlik_indeks + 1,
+                        "toplam": len(etkinlik_kuyrugu), "hata_mesaji": str(e)[:200],
+                    })
+            else:
+                etkinlik_calisiyor = False
+                _oynatma_durumu_yaz({"durum": "tamamlandi"})
+                print("🎉 Etkinlik oynatma kuyruğu tamamlandı.")
+
+        await asyncio.sleep(3)
 
 def duyuru_hedefi_gecerli_mi(hedef):
     if YOUTUBE_LINK_RE.search(hedef):
@@ -531,8 +671,8 @@ async def duyuru_otomasyonu(bot):
                 if fark_dk <= 2:
                     try:
                         if d["tur"] == "youtube":
-                            audio_url, baslik = youtube_ses_url_al(d["hedef"])
-                            player.set_media(instance.media_new(audio_url))
+                            dosya_yolu, baslik = youtube_indir(d["hedef"])
+                            player.set_media(instance.media_new(dosya_yolu))
                         else:
                             kok = BASE_DIR if d["hedef"] in ("istiklal.mp3", "siren.mp3") else PLAYLIST_DIR
                             baslik = d["hedef"]
@@ -583,6 +723,7 @@ async def main():
     # Teneffüs ve duyuru döngülerini arka planda başlat
     asyncio.create_task(tenefus_otomasyonu())
     asyncio.create_task(duyuru_otomasyonu(app.bot))
+    asyncio.create_task(etkinlik_dinleyici())
 
     print("--- SİSTEM VE TENEFFÜS OTOMASYONU AKTİF ---")
     
