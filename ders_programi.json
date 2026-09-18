@@ -1,0 +1,20 @@
+{
+  "dersler": [
+    {"no": 1, "baslangic": "08:10", "bitis": "08:50"},
+    {"no": 2, "baslangic": "09:00", "bitis": "09:40"},
+    {"no": 3, "baslangic": "09:50", "bitis": "10:30"},
+    {"no": 4, "baslangic": "10:40", "bitis": "11:20"},
+    {"no": 5, "baslangic": "11:30", "bitis": "12:10"},
+    {"no": 6, "baslangic": "13:30", "bitis": "14:10"},
+    {"no": 7, "baslangic": "14:20", "bitis": "15:00"},
+    {"no": 8, "baslangic": "15:10", "bitis": "15:50"}
+  ],
+  "ders_gunleri": [1, 2, 3, 4, 5],
+  "karsilama_muzigi": {"aktif": true, "baslama": "07:50", "durdurma": "07:55"},
+  "ayarlar": {
+    "zil_aktif": true,
+    "tenefus_muzigi_aktif": true,
+    "otomatik_ses_seviyesi": 50,
+    "zil_ses_seviyesi": 80
+  }
+}

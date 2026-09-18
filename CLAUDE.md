@@ -35,9 +35,17 @@ Tek dosyalık bot: `sys.py` (aktif/production kod, `BASE_DIR` = proje kökü).
   - Ayrıca sabit bir 8. slot: **07:50–07:55 arası** (ilk ders 08:10'da başlıyor) rastgele bir parça çalınıyor — "okul girişi karşılama müziği" (2026-09-16, kullanıcı isteği), `TENEFUS_OLAYLARI` listesine elle eklendi.
 - Tek bir global `vlc.MediaPlayer` instance'ı var — aynı anda tek ses çalınabiliyor, yeni bir çalma isteği öncekini kesiyor. `current_volume` (varsayılan %70, `/ses_artir`/`/ses_azalt` ile değişir) manuel çalmalarda, `OTOMATIK_SES_SEVIYESI` (%50, sabit) otomatik teneffüs/giriş/YouTube çalmalarında kullanılıyor.
 
+## Planlanan: Web Dashboard + Gerçek Zil Sesi (tasarım tamamlandı, henüz UYGULANMADI — 2026-09-18)
+
+Detaylı spec: `docs/superpowers/specs/2026-09-18-zil-dashboard-design.md` (durumu: "Onaylandı, uygulama planına geçiliyor"). **Bu spec'e göre kod henüz yazılmadı** — `dashboard.py` yok, `ses_dashboard` servisi kurulmadı, port 8090 kapalı (2026-09-18'de `ss -tlnp` ile doğrulandı: sadece 22/53/631 açık). Bu alanda çalışmadan önce spec dosyasını oku.
+
+Kapsam: (1) `sys.py`'ye şu an eksik olan **gerçek zil sesi** özelliği (ders giriş/çıkış anında çalma — bugün sadece teneffüs *arası* müzik var), (2) ayrı bir Flask+waitress web dashboard'u (`ses_dashboard` systemd servisi, port 8090, HTTP Basic Auth) ile ders programı/zil sesi/ayarların yönetimi.
+
+Kilit mimari karar: dashboard ile `sys.py` arasında canlı IPC (HTTP/soket/kuyruk) **yok** — sadece dosya paylaşımı (`ders_programi.json`, `zil_sesi.mp3`, atomik `os.replace` yazımıyla); `sys.py`'nin zaten var olan 30sn'lik `tenefus_otomasyonu()` döngüsü bu dosyaları periyodik okuyacak şekilde genişletilecek. Zil sesi çalma, teneffüs müziğinin aksine `son_calinan_zil_dakikasi` gibi açık bir "bu dakika çalındı" guard'ı gerektiriyor (ses kısa olduğu için `not player.is_playing()` tek başına yetersiz — çift tetiklenmeye yol açar). Farabi'nin `zil.json`'uyla hiçbir otomatik senkron yok (bilinçli kapsam dışı, ders programı bu projede elle girilir). 4 fazlı uygulama planı (A: zil sesi çekirdek mantığı, B: dashboard iskeleti, C: zil sesi upload + ayarlar, D: playlist yönetimi) spec dosyasında.
+
 ## Ortam Değişkenleri (`env.txt`)
 
-`ayarlari_yukle()` proje kökündeki `env.txt`'yi (`utf-8-sig`, BOM'lu) `KEY=VALUE` formatında okuyor: `TELEGRAM_TOKEN` ve `CHAT_ID` (virgülle ayrılmış, yetkili Telegram chat id'leri). **Bu dosyayı asla artifact/web/dış servise göndermeyin veya içeriğini dışarı kopyalamayın** — canlı bot token'ı içeriyor.
+`ayarlari_yukle()` proje kökündeki `env.txt`'yi (`utf-8-sig`, BOM'lu) `KEY=VALUE` formatında okuyor: `TELEGRAM_TOKEN` ve `CHAT_ID` (virgülle ayrılmış, yetkili Telegram chat id'leri). **Bu dosyayı asla artifact/web/dış servise göndermeyin veya içeriğini dışarı kopyalamayın** — canlı bot token'ı içeriyor. (Dashboard uygulanınca aynı dosyaya `DASHBOARD_PASSWORD` eklenecek, bkz. yukarıdaki plan.)
 
 ## Git (2026-09-17'de eklendi)
 

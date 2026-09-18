@@ -21,36 +21,95 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PLAYLIST_DIR = os.path.join(BASE_DIR, "playlist")
 os.makedirs(PLAYLIST_DIR, exist_ok=True)
 
-# Teneffüs Programı — kaynak: Farabi sunucusundaki resmi e-Okul çizelgesi
-# (/home/ata/farabi/tahtayoklama/dashboard/data/zil.json). Okul zili değişirse
-# oradaki dosya da güncellenip buraya elle yansıtılmalı (iki sunucu arasında
-# otomatik senkron yok). Her tuple (ders çıkışı, sonraki ders girişi).
-TENEFUS_PROGRAMI = [
-    ("08:50", "09:00"),
-    ("09:40", "09:50"),
-    ("10:30", "10:40"),
-    ("11:20", "11:30"),
-    ("12:10", "13:30"),   # öğle arası
-    ("14:10", "14:20"),
-    ("15:00", "15:10"),
-]
+# Ders programı — 2026-09-18'den itibaren ders_programi.json'dan okunuyor (bkz.
+# docs/superpowers/specs/2026-09-18-zil-dashboard-design.md). Kaynak: Farabi
+# sunucusundaki resmi e-Okul çizelgesi (/home/ata/farabi/tahtayoklama/dashboard/data/zil.json).
+# Okul zili değişirse iki dosya da elle senkron edilmeli (otomatik senkron yok).
+DERS_PROGRAMI_DOSYASI = os.path.join(BASE_DIR, "ders_programi.json")
 
 def saat_ekle(saat_str, dakika):
     t = datetime.strptime(saat_str, "%H:%M") + timedelta(minutes=dakika)
     return t.strftime("%H:%M")
 
-# Her teneffüs için: müzik ders çıkışından 3 dk sonra başlar (kendi süresiyle biter,
-# playlist parçaları zaten ~2 dk), ders girişine 2 dk kala hâlâ çalıyorsa (ve otomatik
-# başlatıldıysa) güvenlik amaçlı durdurulur. Manuel başlatılan müzikler (etkinlik) bu
-# zorla-durdurmadan muaf tutulur (bkz. otomatik_calan bayrağı).
-TENEFUS_OLAYLARI = [
-    {"baslama": saat_ekle(cikis, 3), "durdurma": saat_ekle(giris, -2)}
-    for cikis, giris in TENEFUS_PROGRAMI
-]
+# ders_programi.json okunamazsa/bozuksa kullanılan güvenli varsayılan — bot canlı
+# yayında konfigürasyon dosyasının bozulmasıyla çökmesin diye (2026-09-16 öncesi
+# hardcoded TENEFUS_PROGRAMI ile birebir aynı ders saatleri).
+_VARSAYILAN_DERS_PROGRAMI = {
+    "dersler": [
+        {"no": 1, "baslangic": "08:10", "bitis": "08:50"},
+        {"no": 2, "baslangic": "09:00", "bitis": "09:40"},
+        {"no": 3, "baslangic": "09:50", "bitis": "10:30"},
+        {"no": 4, "baslangic": "10:40", "bitis": "11:20"},
+        {"no": 5, "baslangic": "11:30", "bitis": "12:10"},
+        {"no": 6, "baslangic": "13:30", "bitis": "14:10"},
+        {"no": 7, "baslangic": "14:20", "bitis": "15:00"},
+        {"no": 8, "baslangic": "15:10", "bitis": "15:50"},
+    ],
+    "ders_gunleri": [1, 2, 3, 4, 5],
+    "karsilama_muzigi": {"aktif": True, "baslama": "07:50", "durdurma": "07:55"},
+    "ayarlar": {
+        "zil_aktif": True,
+        "tenefus_muzigi_aktif": True,
+        "otomatik_ses_seviyesi": 50,
+        "zil_ses_seviyesi": 80,
+    },
+}
 
-# Okul girişi karşılama müziği: ilk ders 08:10'da başlıyor, 07:50-07:55 arası
-# rastgele bir playlist parçası çalınsın (2026-09-16, kullanıcı isteği).
-TENEFUS_OLAYLARI.append({"baslama": "07:50", "durdurma": "07:55"})
+ders_programi = {}
+ders_programi_mtime = None
+TENEFUS_OLAYLARI = []
+ZIL_SAATLERI = set()
+OTOMATIK_SES_SEVIYESI = 50
+son_calinan_zil_dakikasi = None
+
+def _ders_programindan_turet(veri):
+    # Teneffüs çiftleri: her ardışık ders ikilisi için (bitiş, sonraki başlangıç) —
+    # eski hardcoded TENEFUS_PROGRAMI mantığının aynısı, artık ders listesinden türetilmiş.
+    # Müzik çıkıştan 3dk sonra başlar, girişe 2dk kala (hâlâ çalıyor VE otomatik başlatıldıysa) durur.
+    dersler = sorted(veri["dersler"], key=lambda d: d["baslangic"])
+    olaylar = [
+        {"baslama": saat_ekle(dersler[i]["bitis"], 3), "durdurma": saat_ekle(dersler[i + 1]["baslangic"], -2)}
+        for i in range(len(dersler) - 1)
+    ]
+    karsilama = veri.get("karsilama_muzigi", {})
+    if karsilama.get("aktif"):
+        olaylar.append({"baslama": karsilama["baslama"], "durdurma": karsilama["durdurma"]})
+    # Zil saatleri: tüm ders başlangıç/bitiş saatlerinin birleşimi (öğle arası için ayrı
+    # bir nokta gerekmiyor — dersler[i].bitis ve dersler[i+1].baslangic zaten kümede).
+    zil_saatleri = sorted({d["baslangic"] for d in dersler} | {d["bitis"] for d in dersler})
+    return olaylar, zil_saatleri
+
+def ders_programi_yukle_gerekirse():
+    # sys.py 30sn'de bir çağırır; dosya değişmediyse hiçbir şey yapmaz (mtime kontrolü).
+    global ders_programi, ders_programi_mtime, TENEFUS_OLAYLARI, ZIL_SAATLERI, OTOMATIK_SES_SEVIYESI
+    try:
+        mtime = os.path.getmtime(DERS_PROGRAMI_DOSYASI)
+    except OSError:
+        mtime = None
+    if mtime == ders_programi_mtime and ders_programi:
+        return
+    veri = None
+    if mtime is not None:
+        try:
+            with open(DERS_PROGRAMI_DOSYASI, "r", encoding="utf-8") as f:
+                veri = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"⚠️ ders_programi.json okunamadı, önceki/varsayılan program kullanılıyor: {e}")
+    if veri is None:
+        veri = ders_programi if ders_programi else _VARSAYILAN_DERS_PROGRAMI
+    try:
+        olaylar, zil_saatleri = _ders_programindan_turet(veri)
+    except (KeyError, IndexError, ValueError) as e:
+        print(f"⚠️ ders_programi.json geçersiz, varsayılan program kullanılıyor: {e}")
+        veri = _VARSAYILAN_DERS_PROGRAMI
+        olaylar, zil_saatleri = _ders_programindan_turet(veri)
+    ders_programi = veri
+    ders_programi_mtime = mtime
+    TENEFUS_OLAYLARI = olaylar
+    ZIL_SAATLERI = zil_saatleri
+    OTOMATIK_SES_SEVIYESI = veri.get("ayarlar", {}).get("otomatik_ses_seviyesi", 50)
+
+ders_programi_yukle_gerekirse()
 
 otomatik_calan = False
 
@@ -129,25 +188,45 @@ def playlist_sayfa_metni(sayfa=1, sayfa_boyutu=40):
     )
 
 async def tenefus_otomasyonu():
-    global otomatik_calan
+    global otomatik_calan, son_calinan_zil_dakikasi
     while True:
+        ders_programi_yukle_gerekirse()
         simdi_dt = datetime.now()
-        # Farabi'nin ders_gunleri'yle aynı: sadece Pazartesi(1)-Cuma(5)
-        if simdi_dt.isoweekday() in (1, 2, 3, 4, 5):
+        ders_gunleri = ders_programi.get("ders_gunleri", [1, 2, 3, 4, 5])
+        if simdi_dt.isoweekday() in ders_gunleri:
             simdi = simdi_dt.strftime("%H:%M")
-            for olay in TENEFUS_OLAYLARI:
-                if simdi == olay["baslama"] and not player.is_playing():
-                    dosya = rastgele_playlist_dosyasi()
-                    if dosya:
-                        yol = os.path.join(PLAYLIST_DIR, dosya)
-                        player.set_media(instance.media_new(yol))
-                        player.play()
-                        player.audio_set_volume(OTOMATIK_SES_SEVIYESI)
-                        otomatik_calan = True
-                        print(f"🔔 Otomatik teneffüs müziği başladı: {dosya} (%{OTOMATIK_SES_SEVIYESI})")
-                if simdi == olay["durdurma"] and player.is_playing() and otomatik_calan:
-                    player.stop()
-                    print("🔕 Ders girişine 2 dk kala otomatik müzik durduruldu.")
+            ayarlar = ders_programi.get("ayarlar", {})
+
+            # Gerçek zil sesi (ders giriş/çıkış anı) — teneffüs müziğinden farklı olarak
+            # kısa bir ses olduğu için "not player.is_playing()" yeterli çift-tetiklenme
+            # koruması sağlamaz (30sn'lik döngü aynı dakikada 2 kez kontrol edebilir).
+            # Bu yüzden ayrı, açık bir "bu dakika zaten çalındı" bayrağı kullanılıyor.
+            if ayarlar.get("zil_aktif", True) and simdi in ZIL_SAATLERI and simdi != son_calinan_zil_dakikasi:
+                son_calinan_zil_dakikasi = simdi
+                zil_yolu = os.path.join(BASE_DIR, "zil_sesi.mp3")
+                if os.path.exists(zil_yolu):
+                    player.set_media(instance.media_new(zil_yolu))
+                    player.play()
+                    player.audio_set_volume(ayarlar.get("zil_ses_seviyesi", 80))
+                    otomatik_calan = True
+                    print(f"🔔 Zil çalındı: {simdi}")
+                else:
+                    print(f"⚠️ Zil çalınamadı, zil_sesi.mp3 bulunamadı (saat {simdi})")
+
+            if ayarlar.get("tenefus_muzigi_aktif", True):
+                for olay in TENEFUS_OLAYLARI:
+                    if simdi == olay["baslama"] and not player.is_playing():
+                        dosya = rastgele_playlist_dosyasi()
+                        if dosya:
+                            yol = os.path.join(PLAYLIST_DIR, dosya)
+                            player.set_media(instance.media_new(yol))
+                            player.play()
+                            player.audio_set_volume(OTOMATIK_SES_SEVIYESI)
+                            otomatik_calan = True
+                            print(f"🔔 Otomatik teneffüs müziği başladı: {dosya} (%{OTOMATIK_SES_SEVIYESI})")
+                    if simdi == olay["durdurma"] and player.is_playing() and otomatik_calan:
+                        player.stop()
+                        print("🔕 Ders girişine 2 dk kala otomatik müzik durduruldu.")
         await asyncio.sleep(30)
 
 # --- 2. KOMUTLAR ---
