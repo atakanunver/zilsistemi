@@ -549,6 +549,22 @@ async def etkinlik_dinleyici():
                     etkinlik_calisiyor = False
                     _oynatma_durumu_yaz({"durum": "hata", "hata_mesaji": str(e)[:200]})
                     print(f"⚠️ Etkinlik oynatma hatası: {e}")
+            elif istek.get("komut") == "zil_cal":
+                # Dashboard'daki "Şimdi Zil Çal" butonu — zamanlanmış zil mantığına
+                # (tenefus_otomasyonu) dokunmadan, aynı zil_sesi.mp3'ü hemen manuel çalar.
+                global otomatik_calan
+                zil_yolu = os.path.join(BASE_DIR, "zil_sesi.mp3")
+                if os.path.exists(zil_yolu):
+                    ders_programi_yukle_gerekirse()
+                    player.set_media(instance.media_new(zil_yolu))
+                    player.play()
+                    player.audio_set_volume(ders_programi.get("ayarlar", {}).get("zil_ses_seviyesi", 80))
+                    otomatik_calan = True
+                    _oynatma_durumu_yaz({"durum": "zil_calindi"})
+                    print("🔔 Zil manuel çalındı (dashboard isteği).")
+                else:
+                    _oynatma_durumu_yaz({"durum": "hata", "hata_mesaji": "zil_sesi.mp3 bulunamadı."})
+                    print("⚠️ Manuel zil çalınamadı, zil_sesi.mp3 bulunamadı.")
 
         # 2) Kuyrukta bir sonraki parçaya geçiş (mevcut parça kendiliğinden bittiyse).
         # DİKKAT: "not player.is_playing()" burada YANLIŞ olurdu — play() çağrıldıktan

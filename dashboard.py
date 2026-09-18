@@ -100,12 +100,13 @@ def sayfa(baslik, icerik, mesaj=None, hata=None):
   * {{ box-sizing: border-box; }}
   body {{ margin:0; background:var(--bg); color:var(--text); font-family:system-ui,-apple-system,'Segoe UI',sans-serif; }}
   nav {{ display:flex; gap:4px; flex-wrap:wrap; padding:12px 20px; background:var(--panel); border-bottom:1px solid var(--border); }}
-  nav a {{ color:var(--muted); text-decoration:none; padding:8px 14px; border-radius:6px; font-size:14px; }}
-  nav a:hover, nav a.active {{ background:var(--accent); color:#fff; }}
+  nav a {{ color:var(--muted); text-decoration:none; padding:8px 14px; border-radius:6px; font-size:14px; border-bottom:2px solid transparent; transition:background .15s,color .15s; }}
+  nav a:hover {{ background:#22303d; color:var(--text); }}
+  nav a.active {{ background:var(--accent); color:#fff; border-bottom-color:#fff; }}
   main {{ max-width:860px; margin:0 auto; padding:24px 20px 60px; }}
   h1 {{ font-size:20px; margin:0 0 4px; }}
   h2 {{ font-size:15px; color:var(--muted); margin:28px 0 10px; text-transform:uppercase; letter-spacing:.04em; }}
-  .card {{ background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:18px 20px; margin-bottom:16px; }}
+  .card {{ background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:18px 20px; margin-bottom:16px; box-shadow:0 1px 3px rgba(0,0,0,.3); }}
   table {{ width:100%; border-collapse:collapse; }}
   th, td {{ text-align:left; padding:8px 6px; border-bottom:1px solid var(--border); font-size:14px; }}
   th {{ color:var(--muted); font-weight:500; font-size:12px; text-transform:uppercase; }}
@@ -113,9 +114,13 @@ def sayfa(baslik, icerik, mesaj=None, hata=None):
     background:#0f1720; border:1px solid var(--border); color:var(--text); border-radius:6px; padding:7px 9px; font-size:14px; width:100%;
   }}
   input[type=range] {{ width:100%; }}
-  button, .btn {{ background:var(--accent); color:#fff; border:none; border-radius:6px; padding:8px 16px; font-size:14px; cursor:pointer; }}
+  button, .btn {{ background:var(--accent); color:#fff; border:none; border-radius:6px; padding:8px 16px; font-size:14px; cursor:pointer; transition:filter .15s,transform .05s; }}
+  button:hover, .btn:hover {{ filter:brightness(1.12); }}
+  button:active, .btn:active {{ transform:scale(.98); }}
+  button:disabled {{ opacity:.6; cursor:default; filter:none; }}
   button.danger {{ background:var(--err); }}
   button.secondary {{ background:#2d3947; }}
+  button.zil-buton {{ background:var(--accent); font-size:17px; font-weight:600; padding:16px 22px; width:100%; border-radius:10px; }}
   label {{ font-size:13px; color:var(--muted); display:block; margin-bottom:4px; }}
   .row {{ display:flex; gap:10px; align-items:end; margin-bottom:10px; flex-wrap:wrap; }}
   .row > div {{ flex:1; min-width:90px; }}
@@ -234,6 +239,26 @@ def ozet():
 
     icerik = f"""
     <div class="card">
+      <button class="zil-buton" id="zil-cal-buton" onclick="zilCal()">🔔 Şimdi Zil Çal</button>
+      <div id="zil-cal-durum" class="small" style="margin-top:8px"></div>
+    </div>
+    <script>
+    function zilCal() {{
+      if (!confirm('Zil şimdi bina genelinde çalınsın mı?')) return;
+      var btn = document.getElementById('zil-cal-buton');
+      var durum = document.getElementById('zil-cal-durum');
+      btn.disabled = true;
+      durum.textContent = '🔔 Çalınıyor...';
+      fetch(location.origin + '/zil-cal', {{method: 'POST', credentials: 'same-origin'}})
+        .then(function(r) {{ return r.json(); }})
+        .then(function(d) {{
+          durum.textContent = d.tamam ? '✅ Zil çalındı.' : ('❌ ' + (d.hata || 'Zil çalınamadı.'));
+        }})
+        .catch(function(e) {{ durum.textContent = '❌ İstek başarısız: ' + e; }})
+        .finally(function() {{ setTimeout(function() {{ btn.disabled = false; }}, 2000); }});
+    }}
+    </script>
+    <div class="card">
       <div class="small">Bugün: {GUN_ADLARI.get(bugun_iso, "?")} · {bugun_tarih} · şu an {simdi_hhmm}</div>
       <p style="font-size:15px;margin:10px 0 0">{durum}</p>
     </div>
@@ -256,6 +281,18 @@ def ozet():
     <p class="small">Detaylı düzenleme: <a class="link" href="/program">Ders Programı</a>, <a class="link" href="/ayarlar">Ayarlar</a>, <a class="link" href="/zil-sesi">Zil Sesi</a>, <a class="link" href="/playlist">Playlist</a>.</p>
     """
     return sayfa("Özet", icerik)
+
+
+@app.route("/zil-cal", methods=["POST"])
+@yetki_gerekli
+def zil_cal():
+    # sys.py'deki etkinlik_dinleyici() ile paylaşılan aynı dosya-tabanlı IPC kanalı
+    # (youtube-cal ile aynı desen) — burada sadece "zil_cal" komutu yazılıyor, sonucu
+    # ayrıca sorgulamaya gerek yok çünkü zil sesi kısa (dashboard tarafı sadece isteğin
+    # kabul edildiğini bildiriyor, gerçek çalma sys.py tarafında ~3sn içinde gerçekleşir).
+    istek = {"istek_id": str(uuid.uuid4()), "komut": "zil_cal"}
+    _atomik_yaz(OYNATMA_ISTEGI_DOSYASI, json.dumps(istek, ensure_ascii=False).encode("utf-8"))
+    return jsonify({"tamam": True})
 
 
 def _dersler_form_alanlarindan_olustur(form, alan_no, alan_b, alan_s, boyut_uyari_prefix):
@@ -699,7 +736,7 @@ def youtube_cal_sayfasi():
       el.textContent = JSON.stringify(d);
     }
     function durumCek() {
-      fetch('/youtube-cal/durum', {credentials: 'same-origin'})
+      fetch(location.origin + '/youtube-cal/durum', {credentials: 'same-origin'})
         .then(function(r){ return r.json(); })
         .then(durumGuncelle)
         .catch(function(e){ document.getElementById('durum-alani').textContent = '⚠️ Durum alınamadı: ' + e; });
@@ -707,12 +744,12 @@ def youtube_cal_sayfasi():
     document.getElementById('cal-form').addEventListener('submit', function(e) {
       e.preventDefault();
       var url = document.getElementById('youtube-url').value;
-      fetch('/youtube-cal/baslat', {method: 'POST', credentials: 'same-origin', headers: {'Content-Type': 'application/x-www-form-urlencoded'}, body: 'url=' + encodeURIComponent(url)})
+      fetch(location.origin + '/youtube-cal/baslat', {method: 'POST', credentials: 'same-origin', headers: {'Content-Type': 'application/x-www-form-urlencoded'}, body: 'url=' + encodeURIComponent(url)})
         .then(function(){ document.getElementById('durum-alani').textContent = 'Başlatılıyor...'; setTimeout(durumCek, 1000); });
     });
     document.getElementById('durdur-form').addEventListener('submit', function(e) {
       e.preventDefault();
-      fetch('/youtube-cal/durdur', {method: 'POST', credentials: 'same-origin'}).then(function(){ setTimeout(durumCek, 1000); });
+      fetch(location.origin + '/youtube-cal/durdur', {method: 'POST', credentials: 'same-origin'}).then(function(){ setTimeout(durumCek, 1000); });
     });
     durumCek();
     setInterval(durumCek, 3000);
