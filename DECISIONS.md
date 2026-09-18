@@ -30,3 +30,14 @@
 - .gitignore'a *.tmp / *.tmp-yazim eklendi (atomik yazim gecicileri commitlenmesin diye).
 - Erisim: http://192.168.23.230:8090 her zaman calisir; avahi aktif oldugundan http://zil.local:8090 da calisir. Salt zil:8090 (NetBIOS, noktasiz) icin nmbd/Samba kurulu degil - istenirse ayrica eklenebilir.
 - zil.mp3 kullanici tarafindan proje klasorune eklendi, zil_sesi.mp3 olarak kopyalandi (20sn, siren.mp3'ten farkli olarak kisa - zil icin uygun). siren.mp3'un deprem/sel gibi acil durumlarda SADECE manuel (/siren) kullanilan bir ses oldugu netlesti, hicbir otomasyona baglanmamali (CLAUDE.md'ye eklendi).
+
+## 2026-09-18 - Coklu program semasi: hafta ici / hafta sonu (ve istenirse cumartesi/pazar) ayri ayri
+
+- Kullanici istegi: cumartesi ve pazarin zil programi hafta icinden ayri olsun, saatleri ayri ayarlanabilsin.
+- ders_programi.json'daki tekli dersler/ders_gunleri alanlari kaldirildi, yerine programlar listesi geldi: her program kendi id/ad/gunler(1-7)/dersler'ine sahip. Bir gun ayni anda sadece bir programa ait olabilir (dashboard bunu kaydetmeden once kontrol ediyor, cakisirsa reddediyor).
+- sys.py: GUNLUK_PROGRAM = {gun(1-7): {olaylar, zil_saatleri}} - _ders_programindan_turet artik her program icin ayri hesaplayip kendi gunlerine dagitiyor. tenefus_otomasyonu() artik o gunun GUNLUK_PROGRAM[bugun] kaydini kullaniyor; gun hicbir programda degilse otomasyon o gun hic calismiyor (guvenli varsayilan).
+- Varsayilan migrasyon: mevcut 8 derslik hafta ici program hafta_ici (gun 1-5) olarak tasindi, hafta_sonu (gun 6-7) bos/pasif olarak eklendi - production DAVRANISI DEGISMEDI (hafta sonu zaten otomasyonsuzdu), sadece artik dashboard'dan ayri ayri doldurulabilir.
+- Bug fix (ayni oturumda bulundu): sys.py'de VLC ayarlari bolumundeki eski OTOMATIK_SES_SEVIYESI = 50 sabit atamasi, ders_programi.json'dan yuklenen degeri baslangicta eziyor ve dosya tekrar degisene kadar boyle kaliyordu - satir kaldirildi.
+- dashboard.py /program sayfasi tamamen coklu-program editorune donusturuldu: her program kendi kartinda (ad, gun toggle'lari, ders saatleri, sil butonu), + yeni program ekleme formu, + hicbir programa atanmamis gunler icin uyari rozeti. Karsilama muzigi ayri bir mini-formda (tum programlar icin ortak).
+- Test edildi: gun catismasi (Cuma'yi hem hafta_ici hem hafta_sonuna atamaya calismak) dogru reddedildi, dosya bozulmadi. Python-seviyesinde ayri Cumartesi/Pazar programlariyla farkli saatler dogru hesaplandigi da unit test edildi (test_logic2.py, gecti) - production'a sahte veri konulmadi, gercek hafta sonu saatleri kullanicidan bekleniyor.
+- Deploy: sys.py + dashboard.py + ders_programi.json (migrasyonlu) 09:45'te production'a alindi, her iki servis de saglikli restart oldu, traceback yok.

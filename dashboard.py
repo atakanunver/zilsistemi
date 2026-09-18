@@ -142,6 +142,31 @@ def sayfa(baslik, icerik, mesaj=None, hata=None):
 
 
 # --- / : Özet ---
+TR_HARF_ESLESTIRME = str.maketrans("çğıöşüÇĞİÖŞÜ", "cgiosuCGIOSU")
+
+
+def _id_uret(ad, mevcut_idler):
+    taban = re.sub(r"[^a-z0-9]+", "_", ad.translate(TR_HARF_ESLESTIRME).lower()).strip("_") or "program"
+    aday = taban
+    n = 2
+    while aday in mevcut_idler:
+        aday = f"{taban}_{n}"
+        n += 1
+    return aday
+
+
+def _gunluk_ozet_hesapla(veri, gun_iso):
+    # ozet() ve program() sayfalarında "bugün hangi program geçerli" göstermek için —
+    # sys.py'deki _ders_programindan_turet ile aynı mantığın hafifçe basitleştirilmişi
+    # (sadece zil_saatleri lazım, teneffüs olaylarına gerek yok).
+    for p in veri.get("programlar", []):
+        if gun_iso in p.get("gunler", []):
+            dersler = sorted(p.get("dersler", []), key=lambda d: d["baslangic"])
+            zil_saatleri = sorted({d["baslangic"] for d in dersler} | {d["bitis"] for d in dersler})
+            return p, dersler, zil_saatleri
+    return None, [], []
+
+
 @app.route("/")
 @yetki_gerekli
 def ozet():
@@ -150,24 +175,30 @@ def ozet():
     simdi_hhmm = simdi.strftime("%H:%M")
     bugun_iso = simdi.isoweekday()
     bugun_tarih = simdi.strftime("%Y-%m-%d")
-    ders_gunleri = veri.get("ders_gunleri", [])
     tatil_gunleri = veri.get("tatil_gunleri", [])
     ayarlar = veri.get("ayarlar", {})
-    bugun_okul_gunu = bugun_iso in ders_gunleri and bugun_tarih not in tatil_gunleri
 
-    dersler = sorted(veri.get("dersler", []), key=lambda d: d["baslangic"])
-    zil_saatleri = sorted({d["baslangic"] for d in dersler} | {d["bitis"] for d in dersler})
+    program_bugun, dersler, zil_saatleri = _gunluk_ozet_hesapla(veri, bugun_iso)
+    bugun_tatil = bugun_tarih in tatil_gunleri
+    bugun_okul_gunu = program_bugun is not None and dersler and not bugun_tatil
     sonraki = next((s for s in zil_saatleri if s > simdi_hhmm), None)
 
     def rozet(aktif, etiket):
         return f'<span class="badge {"on" if aktif else "off"}">{etiket}: {"Açık" if aktif else "Kapalı"}</span>'
 
+    if bugun_tatil:
+        durum = "📅 Bugün <b>tatil</b> olarak işaretli — otomasyon çalışmaz."
+    elif not program_bugun or not dersler:
+        durum = "📅 Bugün için tanımlı bir program/ders yok — otomasyon çalışmaz."
+    elif sonraki:
+        durum = f"⏰ Sıradaki zil: <b>{sonraki}</b> ({program_bugun['ad']})"
+    else:
+        durum = f"Bugün ({program_bugun['ad']}) için kalan zil yok."
+
     icerik = f"""
     <div class="card">
       <div class="small">Bugün: {GUN_ADLARI.get(bugun_iso, "?")} · {bugun_tarih} · şu an {simdi_hhmm}</div>
-      <p style="font-size:15px;margin:10px 0 0">
-        {'📅 Bugün <b>okul günü değil</b> (' + ('tatil olarak işaretli' if bugun_tarih in tatil_gunleri else 'ders günü değil') + ') — otomasyon çalışmaz.' if not bugun_okul_gunu else ('⏰ Sıradaki zil: <b>' + sonraki + '</b>' if sonraki else 'Bugün için kalan zil yok.')}
-      </p>
+      <p style="font-size:15px;margin:10px 0 0">{durum}</p>
     </div>
     <div class="card">
       {rozet(ayarlar.get('zil_aktif', True), 'Zil')}
@@ -176,9 +207,9 @@ def ozet():
       <div class="small" style="margin-top:10px">Zil ses seviyesi: %{ayarlar.get('zil_ses_seviyesi', 80)} · Otomatik ses seviyesi: %{ayarlar.get('otomatik_ses_seviyesi', 50)}</div>
     </div>
     <div class="card">
-      <h2 style="margin-top:0">Bugünkü ders saatleri</h2>
-      <table><tr><th>#</th><th>Başlangıç</th><th>Bitiş</th></tr>
-      {''.join(f"<tr><td>{d['no']}</td><td>{d['baslangic']}</td><td>{d['bitis']}</td></tr>" for d in dersler)}
+      <h2 style="margin-top:0">Tanımlı Programlar</h2>
+      <table><tr><th>Program</th><th>Günler</th><th>Ders sayısı</th></tr>
+      {''.join(f"<tr><td>{p['ad']}</td><td>{', '.join(GUN_ADLARI.get(g,'?') for g in p.get('gunler',[]))}</td><td>{len(p.get('dersler',[]))}</td></tr>" for p in veri.get('programlar', []))}
       </table>
     </div>
     <p class="small">Detaylı düzenleme: <a class="link" href="/program">Ders Programı</a>, <a class="link" href="/ayarlar">Ayarlar</a>, <a class="link" href="/zil-sesi">Zil Sesi</a>, <a class="link" href="/playlist">Playlist</a>.</p>
@@ -186,57 +217,55 @@ def ozet():
     return sayfa("Özet", icerik)
 
 
-# --- /program : ders programı + gün toggle + tatil takvimi ---
+def _dersler_form_alanlarindan_olustur(form, alan_no, alan_b, alan_s, boyut_uyari_prefix):
+    nolar = form.getlist(alan_no)
+    baslangiclar = form.getlist(alan_b)
+    bitisler = form.getlist(alan_s)
+    yeni_dersler = []
+    for no, b, s in zip(nolar, baslangiclar, bitisler):
+        b, s = b.strip(), s.strip()
+        if not b and not s:
+            continue  # boş satır atla
+        if not (SAAT_RE.match(b) and SAAT_RE.match(s)):
+            raise ValueError(f"{boyut_uyari_prefix} {no}: saat formatı hatalı (HH:MM).")
+        if s <= b:
+            raise ValueError(f"{boyut_uyari_prefix} {no}: bitiş, başlangıçtan sonra olmalı.")
+        yeni_dersler.append({"no": int(no), "baslangic": b, "bitis": s})
+    yeni_dersler.sort(key=lambda d: d["baslangic"])
+    for i in range(len(yeni_dersler) - 1):
+        if yeni_dersler[i + 1]["baslangic"] < yeni_dersler[i]["bitis"]:
+            raise ValueError(f"Ders {yeni_dersler[i]['no']} ile {yeni_dersler[i+1]['no']} çakışıyor.")
+    return yeni_dersler
+
+
+# --- /program : programlar (hafta içi/hafta sonu/...) + gün ataması + tatil takvimi ---
 @app.route("/program", methods=["GET", "POST"])
 @yetki_gerekli
 def program():
     mesaj = hata = None
     veri = ders_programi_oku()
+    veri.setdefault("programlar", [])
 
     if request.method == "POST":
-        islem = request.form.get("islem", "kaydet")
-
-        if islem == "tatil_ekle":
-            tarih = request.form.get("yeni_tatil", "").strip()
-            if not TARIH_RE.match(tarih):
-                hata = "Geçersiz tarih formatı (YYYY-AA-GG bekleniyor)."
-            else:
+        islem = request.form.get("islem", "")
+        try:
+            if islem == "tatil_ekle":
+                tarih = request.form.get("yeni_tatil", "").strip()
+                if not TARIH_RE.match(tarih):
+                    raise ValueError("Geçersiz tarih formatı (YYYY-AA-GG bekleniyor).")
                 tatiller = set(veri.get("tatil_gunleri", []))
                 tatiller.add(tarih)
                 veri["tatil_gunleri"] = sorted(tatiller)
                 ders_programi_yaz(veri)
                 mesaj = f"Tatil günü eklendi: {tarih}"
 
-        elif islem == "tatil_sil":
-            tarih = request.form.get("tarih", "")
-            veri["tatil_gunleri"] = [t for t in veri.get("tatil_gunleri", []) if t != tarih]
-            ders_programi_yaz(veri)
-            mesaj = f"Tatil günü kaldırıldı: {tarih}"
+            elif islem == "tatil_sil":
+                tarih = request.form.get("tarih", "")
+                veri["tatil_gunleri"] = [t for t in veri.get("tatil_gunleri", []) if t != tarih]
+                ders_programi_yaz(veri)
+                mesaj = f"Tatil günü kaldırıldı: {tarih}"
 
-        else:  # kaydet: dersler + ders_gunleri + karşılama müziği
-            try:
-                nolar = request.form.getlist("ders_no")
-                baslangiclar = request.form.getlist("ders_baslangic")
-                bitisler = request.form.getlist("ders_bitis")
-                yeni_dersler = []
-                for no, b, s in zip(nolar, baslangiclar, bitisler):
-                    b, s = b.strip(), s.strip()
-                    if not b and not s:
-                        continue  # boş satır atla
-                    if not (SAAT_RE.match(b) and SAAT_RE.match(s)):
-                        raise ValueError(f"Ders {no}: saat formatı hatalı (HH:MM).")
-                    if s <= b:
-                        raise ValueError(f"Ders {no}: bitiş, başlangıçtan sonra olmalı.")
-                    yeni_dersler.append({"no": int(no), "baslangic": b, "bitis": s})
-                yeni_dersler.sort(key=lambda d: d["baslangic"])
-                for i in range(len(yeni_dersler) - 1):
-                    if yeni_dersler[i + 1]["baslangic"] < yeni_dersler[i]["bitis"]:
-                        raise ValueError(f"Ders {yeni_dersler[i]['no']} ile {yeni_dersler[i+1]['no']} çakışıyor.")
-                if len(yeni_dersler) < 2:
-                    raise ValueError("En az 2 ders girilmeli (teneffüs hesaplamak için).")
-
-                ders_gunleri = sorted(int(g) for g in request.form.getlist("ders_gunu"))
-
+            elif islem == "karsilama_kaydet":
                 karsilama_aktif = request.form.get("karsilama_aktif") == "on"
                 k_baslama = request.form.get("karsilama_baslama", "").strip()
                 k_durdurma = request.form.get("karsilama_durdurma", "").strip()
@@ -245,39 +274,107 @@ def program():
                         raise ValueError("Karşılama müziği saatleri hatalı (HH:MM).")
                     if k_durdurma <= k_baslama:
                         raise ValueError("Karşılama müziği durdurma, başlamadan sonra olmalı.")
-
-                veri["dersler"] = yeni_dersler
-                veri["ders_gunleri"] = ders_gunleri
                 veri["karsilama_muzigi"] = {"aktif": karsilama_aktif, "baslama": k_baslama or "07:50", "durdurma": k_durdurma or "07:55"}
                 ders_programi_yaz(veri)
-                mesaj = "Ders programı kaydedildi."
-                veri = ders_programi_oku()
-            except ValueError as e:
-                hata = str(e)
+                mesaj = "Karşılama müziği ayarları kaydedildi."
 
-    dersler = sorted(veri.get("dersler", []), key=lambda d: d["baslangic"])
-    ders_gunleri = set(veri.get("ders_gunleri", []))
+            elif islem == "program_ekle":
+                ad = request.form.get("yeni_program_adi", "").strip()
+                if not ad:
+                    raise ValueError("Yeni program için bir ad girin.")
+                mevcut_idler = {p["id"] for p in veri["programlar"]}
+                yeni_id = _id_uret(ad, mevcut_idler)
+                veri["programlar"].append({"id": yeni_id, "ad": ad, "gunler": [], "dersler": []})
+                ders_programi_yaz(veri)
+                mesaj = f"Program eklendi: {ad}. Şimdi günlerini ve ders saatlerini ayarlayın."
+
+            elif islem == "program_sil":
+                program_id = request.form.get("program_id", "")
+                veri["programlar"] = [p for p in veri["programlar"] if p["id"] != program_id]
+                ders_programi_yaz(veri)
+                mesaj = "Program silindi. O günlere artık hiçbir program atanmamış durumda (otomasyon çalışmaz)."
+
+            elif islem == "program_kaydet":
+                program_id = request.form.get("program_id", "")
+                hedef = next((p for p in veri["programlar"] if p["id"] == program_id), None)
+                if hedef is None:
+                    raise ValueError("Program bulunamadı (sayfa yenilenmiş olabilir).")
+                ad = request.form.get("ad", "").strip() or hedef["ad"]
+                yeni_dersler = _dersler_form_alanlarindan_olustur(request.form, "ders_no", "ders_baslangic", "ders_bitis", "Ders")
+                yeni_gunler = sorted(int(g) for g in request.form.getlist("gun"))
+                # Bir gün aynı anda iki programda olamaz — başka bir programla çakışma var mı kontrol et.
+                for diger in veri["programlar"]:
+                    if diger["id"] == program_id:
+                        continue
+                    cakisan = set(diger.get("gunler", [])) & set(yeni_gunler)
+                    if cakisan:
+                        gun_adlari = ", ".join(GUN_ADLARI[g] for g in sorted(cakisan))
+                        raise ValueError(f"{gun_adlari} zaten '{diger['ad']}' programına atanmış. Önce oradan kaldırın.")
+                hedef["ad"] = ad
+                hedef["gunler"] = yeni_gunler
+                hedef["dersler"] = yeni_dersler
+                ders_programi_yaz(veri)
+                mesaj = f"'{ad}' programı kaydedildi."
+
+            veri = ders_programi_oku()
+        except ValueError as e:
+            hata = str(e)
+
     tatil_gunleri = sorted(veri.get("tatil_gunleri", []))
     karsilama = veri.get("karsilama_muzigi", {})
+    tum_atanmis_gunler = set()
+    for p in veri["programlar"]:
+        tum_atanmis_gunler |= set(p.get("gunler", []))
 
-    ders_satirlari = "".join(f"""
-      <div class="row">
-        <div style="max-width:60px"><label>No</label><input type="text" name="ders_no" value="{d['no']}" readonly></div>
-        <div><label>Başlangıç</label><input type="time" name="ders_baslangic" value="{d['baslangic']}"></div>
-        <div><label>Bitiş</label><input type="time" name="ders_bitis" value="{d['bitis']}"></div>
-      </div>""" for d in dersler)
-    # birkaç boş satır (yeni ders eklemek için)
-    for i in range(len(dersler) + 1, len(dersler) + 4):
-        ders_satirlari += f"""
-      <div class="row">
-        <div style="max-width:60px"><label>No</label><input type="text" name="ders_no" value="{i}" readonly></div>
-        <div><label>Başlangıç</label><input type="time" name="ders_baslangic" value=""></div>
-        <div><label>Bitiş</label><input type="time" name="ders_bitis" value=""></div>
-      </div>"""
+    def program_karti(p):
+        dersler = sorted(p.get("dersler", []), key=lambda d: d["baslangic"])
+        gunler = set(p.get("gunler", []))
+        ders_satirlari = "".join(f"""
+          <div class="row">
+            <div style="max-width:60px"><label>No</label><input type="text" name="ders_no" value="{d['no']}" readonly></div>
+            <div><label>Başlangıç</label><input type="time" name="ders_baslangic" value="{d['baslangic']}"></div>
+            <div><label>Bitiş</label><input type="time" name="ders_bitis" value="{d['bitis']}"></div>
+          </div>""" for d in dersler)
+        for i in range(len(dersler) + 1, len(dersler) + 4):
+            ders_satirlari += f"""
+          <div class="row">
+            <div style="max-width:60px"><label>No</label><input type="text" name="ders_no" value="{i}" readonly></div>
+            <div><label>Başlangıç</label><input type="time" name="ders_baslangic" value=""></div>
+            <div><label>Bitiş</label><input type="time" name="ders_bitis" value=""></div>
+          </div>"""
+        gun_togglelari = "".join(f"""
+          <label class="gun-toggle"><input type="checkbox" name="gun" value="{g}" {"checked" if g in gunler else ""}> {ad}</label>
+        """ for g, ad in GUN_ADLARI.items())
+        return f"""
+        <div class="card">
+          <form method="post">
+            <input type="hidden" name="islem" value="program_kaydet">
+            <input type="hidden" name="program_id" value="{p['id']}">
+            <div class="row">
+              <div><label>Program adı</label><input type="text" name="ad" value="{p['ad']}"></div>
+            </div>
+            <h2 style="margin:14px 0 8px">Günler</h2>
+            {gun_togglelari}
+            <h2 style="margin:14px 0 8px">Ders Saatleri</h2>
+            {ders_satirlari}
+            <p class="small">Boş satırlar yok sayılır. 0 veya 1 ders girilirse o gün sadece o dersin zili çalar, teneffüs müziği hesaplanmaz.</p>
+            <button type="submit" style="margin-top:8px">Kaydet</button>
+          </form>
+          <form method="post" style="margin-top:10px" onsubmit="return confirm('\\'{p['ad']}\\' programı tamamen silinsin mi?')">
+            <input type="hidden" name="islem" value="program_sil">
+            <input type="hidden" name="program_id" value="{p['id']}">
+            <button type="submit" class="danger">Programı Sil</button>
+          </form>
+        </div>
+        """
 
-    gun_togglelari = "".join(f"""
-      <label class="gun-toggle"><input type="checkbox" name="ders_gunu" value="{g}" {"checked" if g in ders_gunleri else ""}> {ad}</label>
-    """ for g, ad in GUN_ADLARI.items())
+    programlar_html = "".join(program_karti(p) for p in veri["programlar"]) or '<p class="small">Henüz program tanımlanmamış.</p>'
+
+    atanmamis_gunler = [ad for g, ad in GUN_ADLARI.items() if g not in tum_atanmis_gunler]
+    atanmamis_uyari = (
+        f'<div class="msg err" style="margin-top:0">Şu günlere hiçbir program atanmamış, bu günlerde otomasyon çalışmaz: {", ".join(atanmamis_gunler)}</div>'
+        if atanmamis_gunler else ""
+    )
 
     tatil_satirlari = "".join(f"""
       <div class="row" style="align-items:center">
@@ -286,27 +383,31 @@ def program():
       </div>""" for t in tatil_gunleri) or '<p class="small">Tatil günü işaretlenmemiş.</p>'
 
     icerik = f"""
-    <form method="post">
-      <input type="hidden" name="islem" value="kaydet">
-      <div class="card">
-        <h2 style="margin-top:0">Ders Saatleri</h2>
-        {ders_satirlari}
-        <p class="small">Boş satırlar yok sayılır. Kaydedince otomatik olarak başlangıç saatine göre sıralanır.</p>
-      </div>
-      <div class="card">
-        <h2 style="margin-top:0">Ders Günleri</h2>
-        {gun_togglelari}
-      </div>
-      <div class="card">
-        <h2 style="margin-top:0">Okul Girişi Karşılama Müziği</h2>
+    {atanmamis_uyari}
+    <h2 style="margin-top:0">Programlar</h2>
+    <p class="small">Her program kendi günlerine ve kendi ders saatlerine sahiptir — hafta içi ve hafta sonu (hatta Cumartesi/Pazar) tamamen bağımsız ayarlanabilir. Bir gün aynı anda yalnızca bir programa ait olabilir.</p>
+    {programlar_html}
+    <div class="card">
+      <form method="post" class="row">
+        <input type="hidden" name="islem" value="program_ekle">
+        <div><label>Yeni program adı</label><input type="text" name="yeni_program_adi" placeholder="ör. Cumartesi Kursu" required></div>
+        <div style="flex:0"><button type="submit" class="secondary">Program Ekle</button></div>
+      </form>
+    </div>
+
+    <div class="card">
+      <h2 style="margin-top:0">Okul Girişi Karşılama Müziği</h2>
+      <p class="small">Ders içeren bir programın atandığı her gün geçerlidir (ör. hafta içi + hafta sonu dersi varsa ikisinde de çalar).</p>
+      <form method="post">
+        <input type="hidden" name="islem" value="karsilama_kaydet">
         <label class="gun-toggle"><input type="checkbox" name="karsilama_aktif" {"checked" if karsilama.get('aktif') else ""}> Aktif</label>
         <div class="row">
           <div><label>Başlama</label><input type="time" name="karsilama_baslama" value="{karsilama.get('baslama','07:50')}"></div>
           <div><label>Durdurma</label><input type="time" name="karsilama_durdurma" value="{karsilama.get('durdurma','07:55')}"></div>
         </div>
-      </div>
-      <button type="submit">Kaydet</button>
-    </form>
+        <button type="submit">Kaydet</button>
+      </form>
+    </div>
 
     <div class="card">
       <h2 style="margin-top:0">Tatil Günleri</h2>
@@ -316,7 +417,7 @@ def program():
         <div><label>Yeni tatil günü</label><input type="date" name="yeni_tatil" required></div>
         <div style="flex:0"><button type="submit" class="secondary">Ekle</button></div>
       </form>
-      <p class="small">İşaretli günlerde zil, teneffüs müziği ve karşılama müziğinin hepsi otomatik olarak kapanır.</p>
+      <p class="small">İşaretli günlerde, hangi programa denk gelirse gelsin zil/teneffüs/karşılama müziğinin hepsi otomatik olarak kapanır.</p>
     </div>
     """
     return sayfa("Ders Programı", icerik, mesaj, hata)
