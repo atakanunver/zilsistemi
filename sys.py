@@ -435,6 +435,13 @@ def youtube_indir(url):
         'no_warnings': True,
         'nocheckcertificate': True,
         'outtmpl': os.path.join(YOUTUBE_CACHE_DIR, f"{uuid.uuid4()}.%(ext)s"),
+        # YouTube'un varsayılan denediği istemcilerden biri (ör. visionos) bu okul
+        # ağının IP'sinde "Sign in to confirm you're not a bot" bot-korumasını
+        # tetikliyor (2026-09-18'de tespit edildi) — android istemcisi bu kontrole
+        # takılmıyor, o yüzden önce o deneniyor. android'de ayrı bestaudio akışı
+        # yok (SABR-only kısıtı), bu durumda muxed bir format (ör. 18/360p) iner;
+        # ses için yeterli, VLC zaten sadece sesi çalıyor. web fallback olarak duruyor.
+        'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
